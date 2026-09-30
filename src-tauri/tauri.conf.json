@@ -43,7 +43,7 @@
 	},
 	"plugins": {
 		"updater": {
-			"pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNBMjBGRkNDQzE3RkE3QjgKUldTNHAzL0J6UDhnT2c3TGlWRFd5RFFjSWdQTnhicEc3bmNqOEtndi9zbThSalJNQUhJRW83MGcK",
+			"pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg0NkM3ODBCNjdBNDc3QUIKUldTcmQ2Um5DM2hzaENDcksweEVlWXlhRGZsbDAySyt1UkhZdmNKRldUd2pGRVVvZ0h0eHowdnkK",
 			"endpoints": [
 				"https://github.com/menzies-mariesta-com/portal-desktop-menzies/releases/latest/download/latest.json"
 			]
