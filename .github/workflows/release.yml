@@ -35,9 +35,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux primary: lean bundles only (rule 11-smallest-app-size).
+          # Linux primary: deb+rpm only. AppImage linuxdeploy fails on GHA (no reliable FUSE).
           - platform: ubuntu-22.04
-            args: '--bundles deb,appimage,rpm'
+            args: '--bundles deb,rpm'
           - platform: macos-latest
             args: ''
           - platform: windows-latest
