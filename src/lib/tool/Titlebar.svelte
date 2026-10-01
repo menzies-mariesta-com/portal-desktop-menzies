@@ -13,6 +13,10 @@
 	import WashIcon from '$lib/tool/WashIcon.svelte';
 	import { washIcons } from '$lib/tool/wash-icons';
 	import { requestPortalRefresh } from '$lib/tool/portal-refresh';
+	import { requestFocusConnected } from '$lib/tool/portal-focus';
+	import { connectionStatus, isTauri, type ConnStatus } from '$lib/tool/portal-ipc';
+	import { listen } from '@tauri-apps/api/event';
+	import { onMount } from 'svelte';
 
 	let maximized = $state(false);
 	let appearance = $state<AppearanceMode>(getAppearance());
@@ -21,6 +25,8 @@
 	let updating = $state(false);
 	let toast = $state<{ tone: 'success' | 'error' | 'info' | 'warning'; text: string } | null>(null);
 	let toastTimer: ReturnType<typeof setTimeout> | null = null;
+	let conn = $state<ConnStatus>({ phase: 'idle', message: '' });
+	const isConnected = $derived(conn.phase === 'connected' && !!conn.profileId);
 
 	function showToast(tone: 'success' | 'error' | 'info' | 'warning', text: string) {
 		if (toastTimer) clearTimeout(toastTimer);
@@ -127,6 +133,21 @@
 	$effect(() => {
 		void refreshMaximized();
 	});
+
+	onMount(() => {
+		let unlisten: (() => void) | undefined;
+		if (isTauri()) {
+			void connectionStatus().then((s) => {
+				conn = s;
+			});
+			void listen<ConnStatus>('portal://status', (event) => {
+				conn = event.payload;
+			}).then((fn) => {
+				unlisten = fn;
+			});
+		}
+		return () => unlisten?.();
+	});
 </script>
 
 <svelte:window onpointerdown={onDocPointerDown} onkeydown={onKeydown} />
@@ -149,6 +170,35 @@
 				>{APP_VERSION}</span
 			>
 		</span>
+	</div>
+
+	<div
+		class="pointer-events-auto absolute top-1/2 left-1/2 z-[215] flex -translate-x-1/2 -translate-y-1/2 items-center"
+		data-no-drag
+	>
+		<div
+			class="{washRecipes.tooltipIcon(
+				isConnected ? 'primary' : 'error',
+				'bottom'
+			)} relative z-[220]"
+			data-tip={isConnected ? m.focus_connected() : m.status_not_connected()}
+		>
+			<button
+				type="button"
+				class="btn btn-square btn-sm"
+				class:btn-primary={isConnected}
+				class:btn-error={!isConnected}
+				class:btn-disabled={!isConnected}
+				class:cursor-pointer={isConnected}
+				class:cursor-not-allowed={!isConnected}
+				disabled={!isConnected}
+				aria-disabled={!isConnected}
+				aria-label={isConnected ? m.focus_connected() : m.status_not_connected()}
+				onclick={() => requestFocusConnected()}
+			>
+				<WashIcon icon={washIcons.shield} class="size-4" />
+			</button>
+		</div>
 	</div>
 
 	<div

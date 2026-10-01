@@ -441,6 +441,10 @@ pub fn connect_tunnel(
         set_status(&state_bg, &app_bg, current_status(&state_bg));
 
         let mut hold_released = false;
+        let mut bytecount_on = false;
+        let mut last_bytes_in: u64 = 0;
+        let mut last_bytes_out: u64 = 0;
+        let mut last_byte_at = Instant::now();
         let started = Instant::now();
         while !stop_flag.load(Ordering::SeqCst) {
             if !hold_released {
@@ -458,6 +462,16 @@ pub fn connect_tunnel(
                     let _ = stream.flush();
                     hold_released = true;
                 }
+                if !bytecount_on
+                    && matches!(
+                        current_status(&state_bg).phase,
+                        ConnPhase::Connected | ConnPhase::Connecting
+                    )
+                {
+                    let _ = writeln!(stream, "bytecount 1");
+                    let _ = stream.flush();
+                    bytecount_on = true;
+                }
                 let _ = writeln!(stream, "state");
                 let _ = stream.flush();
                 let mut reader = BufReader::new(stream);
@@ -473,12 +487,46 @@ pub fn connect_tunnel(
                                 continue;
                             }
                             push_log(&state_bg, &app_bg, trimmed.clone());
-                            if trimmed.contains("CONNECTED,SUCCESS")
-                                || trimmed.contains("Initialization Sequence Completed")
-                            {
+                            if let Some((bin, bout)) = parse_bytecount(&trimmed) {
+                                let now = Instant::now();
+                                let dt = now.duration_since(last_byte_at).as_secs_f64().max(0.001);
+                                let down_bps = ((bin.saturating_sub(last_bytes_in)) as f64) / dt;
+                                let up_bps = ((bout.saturating_sub(last_bytes_out)) as f64) / dt;
+                                last_bytes_in = bin;
+                                last_bytes_out = bout;
+                                last_byte_at = now;
+                                let _ = app_bg.emit(
+                                    "portal://traffic",
+                                    serde_json::json!({
+                                        "bytesIn": bin,
+                                        "bytesOut": bout,
+                                        "downBps": down_bps,
+                                        "upBps": up_bps,
+                                    }),
+                                );
+                            }
+                            let vpn_ip = parse_vpn_ip(&trimmed);
+                            let became_connected = trimmed.contains("CONNECTED,SUCCESS")
+                                || trimmed.contains("Initialization Sequence Completed");
+                            if became_connected || vpn_ip.is_some() {
                                 let mut status = current_status(&state_bg);
-                                status.phase = ConnPhase::Connected;
-                                status.message = "Connected".into();
+                                if let Some(ip) = vpn_ip {
+                                    status.vpn_ip = Some(ip);
+                                }
+                                if became_connected {
+                                    let first_connect = status.phase != ConnPhase::Connected;
+                                    status.phase = ConnPhase::Connected;
+                                    status.message = "Connected".into();
+                                    if first_connect {
+                                        status.started_at_ms = Some(
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_millis() as u64)
+                                                .unwrap_or(0),
+                                        );
+                                    }
+                                    bytecount_on = false; // re-enable on next loop
+                                }
                                 set_status(&state_bg, &app_bg, status);
                             }
                             if trimmed.contains("AUTH_FAILED") {
@@ -538,6 +586,75 @@ fn management_release_hold(port: u16) -> Result<(), String> {
     let _ = writeln!(stream, "hold release");
     let _ = stream.flush();
     Ok(())
+}
+
+fn parse_bytecount(line: &str) -> Option<(u64, u64)> {
+    // >BYTECOUNT:in,out  or  >BYTECOUNT_CLI:in,out
+    let rest = line
+        .strip_prefix(">BYTECOUNT:")
+        .or_else(|| line.strip_prefix(">BYTECOUNT_CLI:"))?;
+    let mut parts = rest.split(',');
+    let a = parts.next()?.trim().parse::<u64>().ok()?;
+    let b = parts.next()?.trim().parse::<u64>().ok()?;
+    Some((a, b))
+}
+
+/// Extract the local VPN address from an OpenVPN management state line.
+/// Examples:
+/// `>STATE:ts,CONNECTED,SUCCESS,10.8.0.2,1.2.3.4`
+/// `ts,CONNECTED,SUCCESS,10.8.0.2,1.2.3.4`
+/// `>STATE:ts,ASSIGN_IP,,10.8.0.2,,`
+fn parse_vpn_ip(line: &str) -> Option<String> {
+    let rest = line.strip_prefix(">STATE:").unwrap_or(line);
+    let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let state = parts[1];
+    let ip = parts[3];
+    if ip.is_empty() {
+        return None;
+    }
+    match state {
+        "CONNECTED" if parts.get(2).copied() == Some("SUCCESS") => Some(ip.to_string()),
+        "ASSIGN_IP" => Some(ip.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_vpn_ip;
+
+    #[test]
+    fn parses_connected_success_realtime() {
+        assert_eq!(
+            parse_vpn_ip(">STATE:1710000000,CONNECTED,SUCCESS,10.8.0.2,203.0.113.1"),
+            Some("10.8.0.2".into())
+        );
+    }
+
+    #[test]
+    fn parses_connected_success_poll() {
+        assert_eq!(
+            parse_vpn_ip("1710000000,CONNECTED,SUCCESS,10.8.0.2,203.0.113.1"),
+            Some("10.8.0.2".into())
+        );
+    }
+
+    #[test]
+    fn parses_assign_ip() {
+        assert_eq!(
+            parse_vpn_ip(">STATE:1710000000,ASSIGN_IP,,10.8.0.6,,"),
+            Some("10.8.0.6".into())
+        );
+    }
+
+    #[test]
+    fn ignores_non_ip_states() {
+        assert_eq!(parse_vpn_ip(">STATE:1710000000,CONNECTING,,,,"), None);
+        assert_eq!(parse_vpn_ip(">BYTECOUNT:1,2"), None);
+    }
 }
 
 fn spawn_openvpn(bin: &Path, args: &[String], elevate: bool) -> Result<Child, String> {

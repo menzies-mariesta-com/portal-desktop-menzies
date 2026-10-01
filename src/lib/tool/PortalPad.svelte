@@ -8,6 +8,7 @@
 	import WashSelect from '$lib/tool/WashSelect.svelte';
 	import { washIcons } from '$lib/tool/wash-icons';
 	import { subscribePortalRefresh } from '$lib/tool/portal-refresh';
+	import { subscribeFocusConnected } from '$lib/tool/portal-focus';
 	import {
 		clearProfileCredentials,
 		connectVpn,
@@ -29,6 +30,7 @@
 		type ProfileSummary
 	} from '$lib/tool/portal-ipc';
 	import { loadSettings, saveSettings } from '$lib/store/local-storage/settings';
+	import { parsePortalLogLine } from '$lib/tool/portal-log-line';
 
 	let profiles = $state<ProfileSummary[]>([]);
 	let selectedId = $state<string | null>(null);
@@ -47,6 +49,8 @@
 	let authRemember = $state(true);
 	let authStore = $state<'keyring' | 'session'>('keyring');
 	let authProfileId = $state<string | null>(null);
+	let switchOpen = $state(false);
+	let switchTarget = $state<ProfileSummary | null>(null);
 	let challengeOpen = $state(false);
 	let challengeText = $state('');
 	let challengePassword = $state('');
@@ -54,10 +58,63 @@
 	let onboarded = $state(loadSettings().onboarded);
 	let renameValue = $state('');
 	let reconnectArmed = $state(false);
+	let detailTab = $state<'performance' | 'log'>('performance');
+	let downBps = $state(0);
+	let upBps = $state(0);
+	let bytesIn = $state(0);
+	let bytesOut = $state(0);
 
 	const selected = $derived(profiles.find((p) => p.id === selectedId) ?? null);
 	const filtered = $derived(
 		profiles.filter((p) => p.name.toLowerCase().includes(query.trim().toLowerCase()))
+	);
+
+	function formatDuration(startedAtMs: number | null | undefined): string {
+		if (!startedAtMs) return '0s';
+		const sec = Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
+		const h = Math.floor(sec / 3600);
+		const m_ = Math.floor((sec % 3600) / 60);
+		const s = sec % 60;
+		if (h > 0) return `${h}h ${m_}m`;
+		if (m_ > 0) return `${m_}m ${s}s`;
+		return `${s}s`;
+	}
+
+	const isActiveSession = $derived(status.phase === 'connected' || status.phase === 'connecting');
+	const selectedNeedsSwitch = $derived(
+		!!selected && isActiveSession && !!status.profileId && status.profileId !== selected.id
+	);
+	const selectedOwnsSession = $derived(
+		!!selected && !!status.profileId && status.profileId === selected.id
+	);
+	const selectedIsConnected = $derived(selectedOwnsSession && status.phase === 'connected');
+	const selectedIsConnecting = $derived(
+		selectedOwnsSession && (status.phase === 'connecting' || status.phase === 'reconnecting')
+	);
+	const connectedProfileName = $derived(
+		profiles.find((p) => p.id === status.profileId)?.name ?? m.switch_profile_unknown()
+	);
+	const profileStatusLabel = $derived(
+		selectedIsConnected
+			? m.status_connected()
+			: selectedIsConnecting
+				? m.status_connecting()
+				: m.status_not_connected()
+	);
+	const profileStatusClass = $derived(
+		selectedIsConnected
+			? 'text-success'
+			: selectedIsConnecting
+				? 'text-warning'
+				: 'text-base-content/50'
+	);
+	const profileDurationText = $derived(
+		selectedOwnsSession && (selectedIsConnected || selectedIsConnecting)
+			? formatDuration(status.startedAtMs)
+			: '0s'
+	);
+	const profileVpnIpText = $derived(
+		selectedIsConnected ? (status.vpnIp ?? m.not_available()) : m.not_available()
 	);
 
 	function showToast(tone: 'success' | 'error' | 'info' | 'warning', text: string) {
@@ -69,22 +126,53 @@
 		}, 5000);
 	}
 
-	function formatDuration(startedAtMs: number | null | undefined): string {
-		if (!startedAtMs) return '-';
-		const sec = Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
-		const h = Math.floor(sec / 3600);
-		const m_ = Math.floor((sec % 3600) / 60);
-		const s = sec % 60;
-		if (h > 0) return `${h}h ${m_}m`;
-		if (m_ > 0) return `${m_}m ${s}s`;
-		return `${s}s`;
+	function formatRate(bps: number): string {
+		if (!Number.isFinite(bps) || bps < 0) return '0 B/s';
+		const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+		let v = bps;
+		let i = 0;
+		while (v >= 1024 && i < units.length - 1) {
+			v /= 1024;
+			i += 1;
+		}
+		return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+	}
+
+	function formatBytes(n: number): string {
+		if (!Number.isFinite(n) || n < 0) return '0 B';
+		const units = ['B', 'KB', 'MB', 'GB'];
+		let v = n;
+		let i = 0;
+		while (v >= 1024 && i < units.length - 1) {
+			v /= 1024;
+			i += 1;
+		}
+		return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+	}
+
+	function focusConnectedProfile() {
+		if (!status.profileId) return;
+		selectedId = status.profileId;
+		query = '';
+		detailTab = 'performance';
+	}
+
+	async function openLogTab() {
+		detailTab = 'log';
+		try {
+			logs = await portalLogs();
+		} catch {
+			/* keep current */
+		}
 	}
 
 	async function refreshAll() {
 		try {
 			profiles = await listProfiles();
 			status = await connectionStatus();
-			logs = await portalLogs();
+			if (detailTab === 'log') {
+				logs = await portalLogs();
+			}
 			settings = await loadPortalSettings();
 			if (settings) {
 				authStore = settings.credentialStore;
@@ -157,6 +245,55 @@
 			return;
 		}
 		await doConnect(profile.id);
+	}
+
+	function requestConnect(profile: ProfileSummary) {
+		if (
+			(status.phase === 'connected' || status.phase === 'connecting') &&
+			status.profileId &&
+			status.profileId !== profile.id
+		) {
+			switchTarget = profile;
+			switchOpen = true;
+			return;
+		}
+		void beginConnect(profile);
+	}
+
+	async function waitUntilIdle(timeoutMs = 10000): Promise<void> {
+		const started = Date.now();
+		while (Date.now() - started < timeoutMs) {
+			const next = await connectionStatus();
+			status = next;
+			if (next.phase === 'idle' || next.phase === 'error') return;
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	}
+
+	async function onConfirmSwitch() {
+		const target = switchTarget;
+		if (!target || busy) return;
+		busy = true;
+		try {
+			await disconnectVpn();
+			await waitUntilIdle();
+			showToast('success', m.disconnected());
+			await refreshAll();
+			switchOpen = false;
+			switchTarget = null;
+		} catch (err) {
+			showToast('error', err instanceof Error ? err.message : String(err));
+			return;
+		} finally {
+			busy = false;
+		}
+		await beginConnect(target);
+	}
+
+	function onCancelSwitch() {
+		if (busy) return;
+		switchOpen = false;
+		switchTarget = null;
 	}
 
 	async function doConnect(profileId: string) {
@@ -251,6 +388,9 @@
 		const unsub = subscribePortalRefresh(() => {
 			void refreshAll();
 		});
+		const unsubFocus = subscribeFocusConnected(() => {
+			focusConnectedProfile();
+		});
 		void refreshAll().then(async () => {
 			if (!settings) return;
 			const autoId = settings.autoConnectProfileId;
@@ -263,10 +403,15 @@
 		let unlistenStatus: (() => void) | undefined;
 		let unlistenLog: (() => void) | undefined;
 		let unlistenChallenge: (() => void) | undefined;
+		let unlistenTraffic: (() => void) | undefined;
 		if (isTauri()) {
 			void listen<ConnStatus>('portal://status', (event) => {
 				const prev = status.phase;
 				status = event.payload;
+				if (event.payload.phase !== 'connected') {
+					downBps = 0;
+					upBps = 0;
+				}
 				if (
 					settings?.reconnectOnDrop &&
 					prev === 'connected' &&
@@ -292,9 +437,24 @@
 				unlistenStatus = fn;
 			});
 			void listen<string>('portal://log', (event) => {
+				// Only print into the log panel while that tab is open.
+				if (detailTab !== 'log') return;
 				logs = [...logs, event.payload].slice(-2000);
 			}).then((fn) => {
 				unlistenLog = fn;
+			});
+			void listen<{
+				bytesIn: number;
+				bytesOut: number;
+				downBps: number;
+				upBps: number;
+			}>('portal://traffic', (event) => {
+				bytesIn = event.payload.bytesIn;
+				bytesOut = event.payload.bytesOut;
+				downBps = event.payload.downBps;
+				upBps = event.payload.upBps;
+			}).then((fn) => {
+				unlistenTraffic = fn;
 			});
 			void listen<string>('portal://auth-challenge', (event) => {
 				challengeText = event.payload;
@@ -312,9 +472,11 @@
 
 		return () => {
 			unsub();
+			unsubFocus();
 			unlistenStatus?.();
 			unlistenLog?.();
 			unlistenChallenge?.();
+			unlistenTraffic?.();
 			clearInterval(tick);
 		};
 	});
@@ -336,7 +498,7 @@
 {:else}
 	<div class="flex min-h-0 flex-1 flex-col gap-0 overflow-hidden md:flex-row">
 		<aside
-			class="border-ink-border/15 flex w-full shrink-0 flex-col border-b md:w-72 md:border-r md:border-b-0"
+			class="border-ink-border/15 flex min-h-0 w-full min-w-0 shrink-0 flex-col overflow-hidden border-b md:h-full md:w-72 md:border-r md:border-b-0"
 		>
 			<div class="flex shrink-0 flex-wrap items-center gap-1 p-2">
 				<div class={washRecipes.tooltipIcon('primary', 'bottom')} data-tip={m.import_file()}>
@@ -384,20 +546,22 @@
 					/>
 				</label>
 			</div>
-			<ul class="menu menu-sm min-h-0 flex-1 overflow-y-auto p-1">
+			<ul
+				class="menu menu-sm flex min-h-0 w-full min-w-0 flex-1 flex-col flex-nowrap overflow-x-hidden overflow-y-auto overscroll-contain p-1"
+			>
 				{#if filtered.length === 0}
-					<li class="text-base-content/60 px-2 py-4 text-sm">{m.no_profiles()}</li>
+					<li class="text-base-content/60 w-full px-2 py-4 text-sm">{m.no_profiles()}</li>
 				{:else}
 					{#each filtered as profile (profile.id)}
-						<li>
+						<li class="w-full min-w-0">
 							<button
 								type="button"
-								class="cursor-pointer"
+								class="flex w-full min-w-0 cursor-pointer items-center gap-2 overflow-hidden"
 								class:active={selectedId === profile.id}
 								onclick={() => (selectedId = profile.id)}
 							>
-								<WashIcon icon={washIcons.shield} class="size-4 opacity-70" />
-								<span class="truncate">{profile.name}</span>
+								<WashIcon icon={washIcons.shield} class="size-4 shrink-0 opacity-70" />
+								<span class="min-w-0 flex-1 truncate text-start">{profile.name}</span>
 							</button>
 						</li>
 					{/each}
@@ -415,8 +579,20 @@
 						{selected?.sourcePath ?? ''}
 					</p>
 				</div>
-				<span class="badge badge-outline capitalize">{status.phase}</span>
-				{#if status.phase === 'connected' || status.phase === 'connecting'}
+				{#if selectedNeedsSwitch && selected}
+					<button
+						type="button"
+						class="btn btn-primary btn-sm cursor-pointer"
+						class:loading={busy}
+						disabled={busy}
+						onclick={() => selected && requestConnect(selected)}
+					>
+						{#if !busy}
+							<WashIcon icon={washIcons.plug} class="size-4" />
+						{/if}
+						{m.connect()}
+					</button>
+				{:else if isActiveSession}
 					<button
 						type="button"
 						class="btn btn-error btn-sm cursor-pointer"
@@ -424,7 +600,9 @@
 						disabled={busy}
 						onclick={onDisconnect}
 					>
-						<WashIcon icon={washIcons.unplug} class="size-4" />
+						{#if !busy}
+							<WashIcon icon={washIcons.unplug} class="size-4" />
+						{/if}
 						{m.disconnect()}
 					</button>
 				{:else if selected}
@@ -433,9 +611,11 @@
 						class="btn btn-primary btn-sm cursor-pointer"
 						class:loading={busy}
 						disabled={busy}
-						onclick={() => selected && beginConnect(selected)}
+						onclick={() => selected && requestConnect(selected)}
 					>
-						<WashIcon icon={washIcons.plug} class="size-4" />
+						{#if !busy}
+							<WashIcon icon={washIcons.plug} class="size-4" />
+						{/if}
 						{m.connect()}
 					</button>
 				{/if}
@@ -445,15 +625,15 @@
 				<div class="grid shrink-0 grid-cols-2 gap-2 p-3 text-sm sm:grid-cols-4">
 					<div class="bg-base-200/40 rounded-box p-2">
 						<p class="text-base-content/50 text-xs">{m.status_label()}</p>
-						<p>{status.message || status.phase}</p>
+						<p class={profileStatusClass}>{profileStatusLabel}</p>
 					</div>
 					<div class="bg-base-200/40 rounded-box p-2">
 						<p class="text-base-content/50 text-xs">{m.duration_label()}</p>
-						<p class="font-mono">{formatDuration(status.startedAtMs)}</p>
+						<p class="font-mono">{profileDurationText}</p>
 					</div>
 					<div class="bg-base-200/40 rounded-box p-2">
 						<p class="text-base-content/50 text-xs">{m.vpn_ip_label()}</p>
-						<p class="font-mono">{status.vpnIp ?? m.not_available()}</p>
+						<p class="font-mono">{profileVpnIpText}</p>
 					</div>
 					<div class="bg-base-200/40 rounded-box p-2">
 						<p class="text-base-content/50 text-xs">{m.auth_label()}</p>
@@ -498,21 +678,104 @@
 			{/if}
 
 			<div class="border-ink-border/15 flex min-h-0 flex-1 flex-col border-t">
-				<div class="flex shrink-0 items-center justify-between px-3 py-1">
-					<p class="text-xs font-medium opacity-70">{m.logs_title()}</p>
-					<button
-						type="button"
-						class="btn btn-ghost btn-xs cursor-pointer"
-						onclick={() => navigator.clipboard.writeText(logs.join('\n'))}
-					>
-						<WashIcon icon={washIcons.copy} class="size-3.5" />
-						{m.copy_logs()}
-					</button>
+				<div class="tabs tabs-box tabs-sm mx-3 mt-2 shrink-0">
+					<label class="tab cursor-pointer gap-1">
+						<input
+							type="radio"
+							name="portal_detail_tabs"
+							class="hidden"
+							checked={detailTab === 'performance'}
+							onchange={() => (detailTab = 'performance')}
+						/>
+						<WashIcon icon={washIcons.gauge} class="size-3.5" />
+						{m.tab_performance()}
+					</label>
+					<label class="tab cursor-pointer gap-1">
+						<input
+							type="radio"
+							name="portal_detail_tabs"
+							class="hidden"
+							checked={detailTab === 'log'}
+							onchange={() => void openLogTab()}
+						/>
+						<WashIcon icon={washIcons['scroll-text']} class="size-3.5" />
+						{m.tab_connection_log()}
+					</label>
 				</div>
-				<pre
-					class="bg-base-200/30 min-h-0 flex-1 overflow-auto p-3 font-mono text-xs leading-relaxed">{logs.length
-						? logs.join('\n')
-						: m.logs_empty()}</pre>
+
+				{#if detailTab === 'performance'}
+					<div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-3">
+						{#if selectedIsConnected}
+							<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+								<div class="bg-base-200/40 rounded-box flex items-center gap-3 p-4">
+									<WashIcon icon={washIcons['arrow-down']} class="text-success size-8" />
+									<div>
+										<p class="text-base-content/50 text-xs">{m.speed_down()}</p>
+										<p class="font-mono text-xl font-semibold">{formatRate(downBps)}</p>
+										<p class="text-base-content/50 font-mono text-xs">
+											{m.bytes_in()}: {formatBytes(bytesIn)}
+										</p>
+									</div>
+								</div>
+								<div class="bg-base-200/40 rounded-box flex items-center gap-3 p-4">
+									<WashIcon icon={washIcons['arrow-up']} class="text-info size-8" />
+									<div>
+										<p class="text-base-content/50 text-xs">{m.speed_up()}</p>
+										<p class="font-mono text-xl font-semibold">{formatRate(upBps)}</p>
+										<p class="text-base-content/50 font-mono text-xs">
+											{m.bytes_out()}: {formatBytes(bytesOut)}
+										</p>
+									</div>
+								</div>
+							</div>
+						{:else}
+							<p class="text-base-content/60 p-4 text-sm">{m.perf_idle()}</p>
+						{/if}
+					</div>
+				{:else}
+					<div class="relative flex min-h-0 flex-1 flex-col px-3 pt-1.5 pb-3">
+						<div class="absolute top-2 right-4 z-10">
+							<div class={washRecipes.tooltipIcon('secondary', 'left')} data-tip={m.copy_logs()}>
+								<button
+									type="button"
+									class="{washRecipes.btnRipple} btn-ghost btn-square btn-secondary btn-xs cursor-pointer"
+									aria-label={m.copy_logs()}
+									onclick={() => void navigator.clipboard.writeText(logs.join('\n'))}
+								>
+									<WashIcon icon={washIcons.copy} class="size-3.5" />
+								</button>
+							</div>
+						</div>
+						<div
+							class="mockup-code min-h-0 flex-1 overflow-x-hidden overflow-y-auto font-mono text-xs leading-relaxed"
+							role="log"
+							aria-live="polite"
+							aria-relevant="additions"
+							aria-label={m.logs_title()}
+						>
+							{#if logs.length}
+								{#each logs as line, i (i)}
+									{@const parsed = parsePortalLogLine(line)}
+									<pre
+										data-prefix={parsed.prefix}
+										class="{parsed.prefixClass} !w-full max-w-full !min-w-0 break-all whitespace-pre-wrap"><code
+											class="break-all whitespace-pre-wrap"
+											>{#each parsed.segments as seg, si (`${i}-${si}`)}<span class={seg.className}
+													>{seg.text}</span
+												>{/each}</code
+										></pre>
+								{/each}
+							{:else}
+								<pre
+									data-prefix="~"
+									class="text-base-content/50 !w-full max-w-full !min-w-0 break-all whitespace-pre-wrap"><code
+										class="text-base-content/50 break-all whitespace-pre-wrap"
+										>{m.logs_empty()}</code
+									></pre>
+							{/if}
+						</div>
+					</div>
+				{/if}
 			</div>
 		</section>
 	</div>
@@ -520,60 +783,143 @@
 
 {#if authOpen}
 	<dialog class="modal modal-open">
+		<div class="modal-box bg-transparent p-0 shadow-none sm:max-w-md">
+			<div class="flex min-h-80 items-center justify-center p-2">
+				<form
+					class="card border-base-300 bg-base-100 w-full max-w-sm border shadow-sm"
+					onsubmit={(e) => {
+						e.preventDefault();
+						if (authProfileId && !busy) void doConnect(authProfileId);
+					}}
+				>
+					<div class="card-body gap-4">
+						<h2 class="card-title text-primary font-bold">{m.auth_title()}</h2>
+
+						<fieldset class="fieldset">
+							<label class="label" for="portal-auth-username">
+								{m.username()}<span
+									class="text-error align-top text-sm leading-none"
+									aria-hidden="true">*</span
+								>
+							</label>
+							<label class="input w-full">
+								<WashIcon icon={washIcons.user} class="size-4 opacity-50" />
+								<input
+									id="portal-auth-username"
+									class="grow cursor-text"
+									type="text"
+									name="username"
+									autocomplete="username"
+									bind:value={authUsername}
+									required
+								/>
+							</label>
+						</fieldset>
+
+						<fieldset class="fieldset">
+							<label class="label" for="portal-auth-password">
+								{m.password()}<span
+									class="text-error align-top text-sm leading-none"
+									aria-hidden="true">*</span
+								>
+							</label>
+							<label class="input w-full">
+								<WashIcon icon={washIcons.lock} class="size-4 opacity-50" />
+								<input
+									id="portal-auth-password"
+									class="grow cursor-text"
+									type="password"
+									name="password"
+									autocomplete="current-password"
+									bind:value={authPassword}
+									required
+								/>
+							</label>
+						</fieldset>
+
+						<fieldset class="fieldset">
+							<label class="label" for="portal-auth-key-pass">{m.key_passphrase()}</label>
+							<label class="input w-full">
+								<WashIcon icon={washIcons.key} class="size-4 opacity-50" />
+								<input
+									id="portal-auth-key-pass"
+									class="grow cursor-text"
+									type="password"
+									name="keyPassphrase"
+									autocomplete="off"
+									bind:value={authKeyPass}
+								/>
+							</label>
+						</fieldset>
+
+						<label class="flex cursor-pointer items-center gap-2 text-sm">
+							<input type="checkbox" class="checkbox checkbox-sm" bind:checked={authRemember} />
+							{m.remember_credentials()}
+						</label>
+						{#if authRemember}
+							<div class="flex flex-wrap gap-3 text-sm">
+								<label class="flex cursor-pointer items-center gap-1">
+									<input
+										type="radio"
+										class="radio radio-sm"
+										checked={authStore === 'keyring'}
+										onchange={() => (authStore = 'keyring')}
+									/>
+									{m.store_keyring()}
+								</label>
+								<label class="flex cursor-pointer items-center gap-1">
+									<input
+										type="radio"
+										class="radio radio-sm"
+										checked={authStore === 'session'}
+										onchange={() => (authStore = 'session')}
+									/>
+									{m.store_session()}
+								</label>
+							</div>
+						{/if}
+
+						<div class="card-actions justify-end gap-2">
+							<button
+								type="button"
+								class="btn"
+								disabled={busy}
+								class:cursor-pointer={!busy}
+								class:cursor-not-allowed={busy}
+								onclick={() => (authOpen = false)}>{m.cancel()}</button
+							>
+							<button
+								type="submit"
+								class="btn btn-primary"
+								class:loading={busy}
+								class:cursor-pointer={!busy}
+								class:cursor-not-allowed={busy}
+								disabled={busy}
+								aria-busy={busy}>{m.connect()}</button
+							>
+						</div>
+					</div>
+				</form>
+			</div>
+		</div>
+		<form method="dialog" class="modal-backdrop">
+			<button type="button" class="cursor-pointer" onclick={() => (authOpen = false)}>close</button>
+		</form>
+	</dialog>
+{/if}
+
+{#if switchOpen && switchTarget}
+	<dialog class="modal modal-open">
 		<div class="modal-box">
-			<h2 class="card-title text-primary font-bold">{m.auth_title()}</h2>
-			<p class="text-base-content/70 py-2 text-sm">{m.auth_body()}</p>
-			<label class="form-control w-full">
-				<span class="label-text"
-					>{m.username()}<span class="text-error align-top text-sm" aria-hidden="true">*</span
-					></span
-				>
-				<input class="input input-bordered cursor-text" bind:value={authUsername} required />
-			</label>
-			<label class="form-control mt-2 w-full">
-				<span class="label-text"
-					>{m.password()}<span class="text-error align-top text-sm" aria-hidden="true">*</span
-					></span
-				>
-				<input
-					class="input input-bordered cursor-text"
-					type="password"
-					bind:value={authPassword}
-					required
-				/>
-			</label>
-			<label class="form-control mt-2 w-full">
-				<span class="label-text">{m.key_passphrase()}</span>
-				<input class="input input-bordered cursor-text" type="password" bind:value={authKeyPass} />
-			</label>
-			<label class="mt-3 flex cursor-pointer items-center gap-2 text-sm">
-				<input type="checkbox" class="checkbox checkbox-sm" bind:checked={authRemember} />
-				{m.remember_credentials()}
-			</label>
-			{#if authRemember}
-				<div class="mt-2 flex gap-2 text-sm">
-					<label class="flex cursor-pointer items-center gap-1">
-						<input
-							type="radio"
-							class="radio radio-sm"
-							checked={authStore === 'keyring'}
-							onchange={() => (authStore = 'keyring')}
-						/>
-						{m.store_keyring()}
-					</label>
-					<label class="flex cursor-pointer items-center gap-1">
-						<input
-							type="radio"
-							class="radio radio-sm"
-							checked={authStore === 'session'}
-							onchange={() => (authStore = 'session')}
-						/>
-						{m.store_session()}
-					</label>
-				</div>
-			{/if}
+			<h2 class="card-title text-primary font-bold">{m.switch_profile_title()}</h2>
+			<p class="text-base-content/70 py-2 text-sm">
+				{m.switch_profile_body({
+					target: switchTarget.name,
+					current: connectedProfileName
+				})}
+			</p>
 			<div class="modal-action">
-				<button type="button" class="btn cursor-pointer" onclick={() => (authOpen = false)}
+				<button type="button" class="btn cursor-pointer" disabled={busy} onclick={onCancelSwitch}
 					>{m.cancel()}</button
 				>
 				<button
@@ -581,12 +927,15 @@
 					class="btn btn-primary cursor-pointer"
 					class:loading={busy}
 					disabled={busy}
-					onclick={() => authProfileId && doConnect(authProfileId)}>{m.connect()}</button
+					aria-busy={busy}
+					onclick={onConfirmSwitch}>{m.switch_profile_confirm()}</button
 				>
 			</div>
 		</div>
 		<form method="dialog" class="modal-backdrop">
-			<button type="button" class="cursor-pointer" onclick={() => (authOpen = false)}>close</button>
+			<button type="button" class="cursor-pointer" disabled={busy} onclick={onCancelSwitch}
+				>close</button
+			>
 		</form>
 	</dialog>
 {/if}
