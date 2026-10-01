@@ -106,11 +106,28 @@ fn openvpn_binary_in(resource_root: &Path) -> PathBuf {
             "aarch64" => "linux-aarch64",
             other => other,
         };
-        return resource_root.join(arch).join("openvpn");
+        let nested = resource_root.join(arch).join("openvpn");
+        if nested.is_file() {
+            return nested;
+        }
+        // Older map-glob packaging flattened arch dirs into openvpn/openvpn.
+        let flat = resource_root.join("openvpn");
+        if flat.is_file() {
+            return flat;
+        }
+        nested
     }
     #[cfg(target_os = "windows")]
     {
-        return resource_root.join("windows-x86_64").join("openvpn.exe");
+        let nested = resource_root.join("windows-x86_64").join("openvpn.exe");
+        if nested.is_file() {
+            return nested;
+        }
+        let flat = resource_root.join("openvpn.exe");
+        if flat.is_file() {
+            return flat;
+        }
+        nested
     }
     #[cfg(target_os = "macos")]
     {
@@ -118,7 +135,15 @@ fn openvpn_binary_in(resource_root: &Path) -> PathBuf {
         if aarch.is_file() {
             return aarch;
         }
-        return resource_root.join("macos-x86_64").join("openvpn");
+        let x86 = resource_root.join("macos-x86_64").join("openvpn");
+        if x86.is_file() {
+            return x86;
+        }
+        let flat = resource_root.join("openvpn");
+        if flat.is_file() {
+            return flat;
+        }
+        aarch
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {

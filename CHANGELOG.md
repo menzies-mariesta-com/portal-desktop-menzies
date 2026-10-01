@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- Preserve OpenVPN arch subdirs in the Linux bundle (map directory, not flatten glob)
+- Resolve flattened OpenVPN binary paths from older packages as a fallback
+- Document OpenVPN resource layout; verify bundled binary in Linux release CI
+
 ## 0.1.1
 
 - Show VPN IP, session timer, and live up/down traffic while connected
@@ -8,5 +14,6 @@
 - Drop AppImage from Linux release bundles; refresh Tauri updater public key
 
 ## 0.1.0
+
 - Initial Portal OpenVPN client: import file/folder, connect/disconnect, auth, logs, settings
 - Bundled OpenVPN 2.6 path layout; Linux pkexec elevate; Shield water-block icon

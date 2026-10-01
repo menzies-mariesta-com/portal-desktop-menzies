@@ -81,6 +81,12 @@ jobs:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
         run: npm ci
 
+      - name: Verify bundled OpenVPN (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          test -x src-tauri/resources/openvpn/linux-x86_64/openvpn \
+            || { echo "Missing bundled OpenVPN. Run scripts/fetch-openvpn.sh before release."; exit 1; }
+
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
