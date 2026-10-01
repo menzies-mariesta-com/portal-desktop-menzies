@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 const MAX_LOG_LINES: usize = 2000;
 
@@ -76,7 +76,7 @@ pub fn new_shared_tunnel() -> SharedTunnel {
     Arc::new(Mutex::new(TunnelState::default()))
 }
 
-fn bundled_openvpn() -> Result<PathBuf, String> {
+fn bundled_openvpn(app: &AppHandle) -> Result<PathBuf, String> {
     if let Ok(override_bin) = std::env::var("PORTAL_OPENVPN_BIN") {
         let p = PathBuf::from(override_bin);
         if p.is_file() {
@@ -85,22 +85,8 @@ fn bundled_openvpn() -> Result<PathBuf, String> {
         return Err("PORTAL_OPENVPN_BIN is set but is not a file".into());
     }
 
-    let resource_root = resource_openvpn_dir()?;
-    #[cfg(target_os = "linux")]
-    let candidate = resource_root.join("linux-x86_64").join("openvpn");
-    #[cfg(target_os = "windows")]
-    let candidate = resource_root.join("windows-x86_64").join("openvpn.exe");
-    #[cfg(target_os = "macos")]
-    let candidate = {
-        let aarch = resource_root.join("macos-aarch64").join("openvpn");
-        if aarch.is_file() {
-            aarch
-        } else {
-            resource_root.join("macos-x86_64").join("openvpn")
-        }
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    let candidate = resource_root.join("openvpn");
+    let resource_root = resource_openvpn_dir(app)?;
+    let candidate = openvpn_binary_in(&resource_root);
 
     if candidate.is_file() {
         return Ok(candidate);
@@ -112,26 +98,81 @@ fn bundled_openvpn() -> Result<PathBuf, String> {
     ))
 }
 
-fn resource_openvpn_dir() -> Result<PathBuf, String> {
-    // Dev: src-tauri/resources/openvpn next to CARGO_MANIFEST_DIR
+fn openvpn_binary_in(resource_root: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "linux-x86_64",
+            "aarch64" => "linux-aarch64",
+            other => other,
+        };
+        return resource_root.join(arch).join("openvpn");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return resource_root.join("windows-x86_64").join("openvpn.exe");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let aarch = resource_root.join("macos-aarch64").join("openvpn");
+        if aarch.is_file() {
+            return aarch;
+        }
+        return resource_root.join("macos-x86_64").join("openvpn");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        resource_root.join("openvpn")
+    }
+}
+
+fn resource_openvpn_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let mut tried: Vec<PathBuf> = Vec::new();
+
+    // Packaged / tauri-action: resolve via PathResolver (deb, AppImage, etc.)
+    if let Ok(rd) = app.path().resource_dir() {
+        for rel in ["resources/openvpn", "openvpn", "../resources/openvpn"] {
+            let p = rd.join(rel);
+            tried.push(p.clone());
+            if p.is_dir() {
+                return Ok(p);
+            }
+        }
+        // Flat: resource_dir itself contains linux-x86_64/
+        tried.push(rd.clone());
+        if openvpn_binary_in(&rd).is_file() {
+            return Ok(rd);
+        }
+    }
+
+    // Dev: src-tauri/resources/openvpn (compile-time crate root)
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/openvpn");
+    tried.push(manifest.clone());
     if manifest.is_dir() {
         return Ok(manifest);
     }
-    // Packaged: relative to executable
+
+    // Dev / copied beside binary (tauri copies bundle.resources next to exe)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let beside = dir.join("resources/openvpn");
-            if beside.is_dir() {
-                return Ok(beside);
-            }
-            let sibling = dir.join("../resources/openvpn");
-            if sibling.is_dir() {
-                return Ok(sibling);
+            for rel in ["resources/openvpn", "../resources/openvpn"] {
+                let p = dir.join(rel);
+                tried.push(p.clone());
+                if p.is_dir() {
+                    return Ok(p);
+                }
             }
         }
     }
-    Err("OpenVPN resource directory not found".into())
+
+    Err(format!(
+        "OpenVPN resource directory not found. Tried: {}",
+        tried
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 fn pick_management_port() -> u16 {
@@ -298,7 +339,7 @@ pub fn connect_tunnel(
         }
     }
 
-    let openvpn = bundled_openvpn()?;
+    let openvpn = bundled_openvpn(&app)?;
     let mgmt_port = pick_management_port();
     let stop_flag = Arc::new(AtomicBool::new(false));
 

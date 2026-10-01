@@ -39,7 +39,10 @@
 			"icons/icon.icns",
 			"icons/icon.ico"
 		],
-		"resources": ["resources/openvpn/**/*", "resources/helper/**/*"]
+		"resources": {
+			"resources/openvpn/**/*": "openvpn/",
+			"resources/helper/**/*": "helper/"
+		}
 	},
 	"plugins": {
 		"updater": {
