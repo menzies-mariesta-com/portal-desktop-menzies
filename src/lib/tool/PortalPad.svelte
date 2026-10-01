@@ -265,23 +265,28 @@
 		let unlistenChallenge: (() => void) | undefined;
 		if (isTauri()) {
 			void listen<ConnStatus>('portal://status', (event) => {
+				const prev = status.phase;
 				status = event.payload;
 				if (
 					settings?.reconnectOnDrop &&
+					prev === 'connected' &&
 					event.payload.phase === 'error' &&
 					event.payload.profileId &&
-					!reconnectArmed
+					!reconnectArmed &&
+					!busy
 				) {
 					reconnectArmed = true;
 					const id = event.payload.profileId;
 					const profile = profiles.find((p) => p.id === id);
-					if (profile) {
-						void beginConnect(profile).finally(() => {
+					window.setTimeout(() => {
+						if (profile) {
+							void beginConnect(profile).finally(() => {
+								reconnectArmed = false;
+							});
+						} else {
 							reconnectArmed = false;
-						});
-					} else {
-						reconnectArmed = false;
-					}
+						}
+					}, 1500);
 				}
 			}).then((fn) => {
 				unlistenStatus = fn;

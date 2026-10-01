@@ -214,23 +214,31 @@ pub fn current_logs(state: &SharedTunnel) -> Vec<String> {
 }
 
 pub fn disconnect_tunnel(state: &SharedTunnel, app: &AppHandle) -> Result<(), String> {
-    let (port, kill_switch) = {
+    let (port, kill_switch, child) = {
         let mut guard = state.lock().map_err(|e| e.to_string())?;
         guard.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(mut child) = guard.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        (guard.status.management_port, guard.kill_switch)
+        let child = guard.child.take();
+        (guard.status.management_port, guard.kill_switch, child)
     };
 
+    // Prefer graceful OpenVPN exit via management (works when process is elevated).
     if let Some(port) = port {
         let _ = management_signal(port, "SIGTERM");
     }
 
+    if let Some(mut child) = child {
+        let _ = child.kill();
+        // Never block the UI / IPC thread on wait.
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+
     #[cfg(target_os = "linux")]
     if kill_switch {
-        let _ = clear_kill_switch();
+        thread::spawn(|| {
+            let _ = clear_kill_switch();
+        });
     }
 
     set_status(
@@ -343,38 +351,21 @@ pub fn connect_tunnel(
     let mgmt_port = pick_management_port();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    if args.kill_switch {
-        apply_kill_switch()?;
-    }
-
-    let mut cmd_args: Vec<String> = vec![
-        "--config".into(),
-        args.config_path.to_string_lossy().into_owned(),
-        "--management".into(),
-        "127.0.0.1".into(),
-        mgmt_port.to_string(),
-        "--management-query-passwords".into(),
-        "--management-hold".into(),
-        "--verb".into(),
-        "3".into(),
-    ];
-    if let Some(auth) = &args.auth_user_pass_path {
-        cmd_args.push("--auth-user-pass".into());
-        cmd_args.push(auth.to_string_lossy().into_owned());
-    }
-
-    let child = spawn_openvpn(&openvpn, &cmd_args, args.elevate)?;
-
+    // Mark connecting before any elevated dialog so the UI stays responsive.
     {
         let mut guard = state.lock().map_err(|e| e.to_string())?;
-        guard.child = Some(child);
         guard.stop_flag = stop_flag.clone();
         guard.kill_switch = args.kill_switch;
         guard.log_lines.clear();
+        guard.child = None;
         guard.status = ConnStatus {
             phase: ConnPhase::Connecting,
             profile_id: Some(args.profile_id.clone()),
-            message: "Connecting".into(),
+            message: if args.elevate {
+                "Waiting for authentication (polkit)...".into()
+            } else {
+                "Connecting".into()
+            },
             vpn_ip: None,
             started_at_ms: Some(
                 std::time::SystemTime::now()
@@ -387,76 +378,155 @@ pub fn connect_tunnel(
     }
     set_status(&state, &app, current_status(&state));
 
-    // Release hold and watch logs via management + process stdout
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(400));
-        let _ = management_release_hold(mgmt_port);
+    let cmd_args: Vec<String> = {
+        let mut v = vec![
+            "--config".into(),
+            args.config_path.to_string_lossy().into_owned(),
+            "--management".into(),
+            "127.0.0.1".into(),
+            mgmt_port.to_string(),
+            "--management-query-passwords".into(),
+            "--verb".into(),
+            "3".into(),
+        ];
+        if let Some(auth) = &args.auth_user_pass_path {
+            v.push("--auth-user-pass".into());
+            v.push(auth.to_string_lossy().into_owned());
+        }
+        v
+    };
 
+    let state_bg = state.clone();
+    let app_bg = app.clone();
+    let elevate = args.elevate;
+    let kill_switch = args.kill_switch;
+
+    thread::spawn(move || {
+        if kill_switch {
+            if let Err(err) = apply_kill_switch() {
+                push_log(&state_bg, &app_bg, format!("Kill switch: {err}"));
+                let mut status = current_status(&state_bg);
+                status.phase = ConnPhase::Error;
+                status.message = err;
+                set_status(&state_bg, &app_bg, status);
+                return;
+            }
+        }
+
+        let child = match spawn_openvpn(&openvpn, &cmd_args, elevate) {
+            Ok(c) => c,
+            Err(err) => {
+                let mut status = current_status(&state_bg);
+                status.phase = ConnPhase::Error;
+                status.message = err;
+                set_status(&state_bg, &app_bg, status);
+                return;
+            }
+        };
+
+        {
+            if let Ok(mut guard) = state_bg.lock() {
+                if guard.stop_flag.load(Ordering::SeqCst) {
+                    let mut child = child;
+                    let _ = child.kill();
+                    thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    return;
+                }
+                guard.child = Some(child);
+                guard.status.message = "Connecting".into();
+            }
+        }
+        set_status(&state_bg, &app_bg, current_status(&state_bg));
+
+        let mut hold_released = false;
         let started = Instant::now();
         while !stop_flag.load(Ordering::SeqCst) {
+            if !hold_released {
+                if management_release_hold(mgmt_port).is_ok() {
+                    hold_released = true;
+                    push_log(&state_bg, &app_bg, "Management hold released".into());
+                }
+            }
+
             if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", mgmt_port)) {
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
+                if !hold_released {
+                    let _ = writeln!(stream, "hold release");
+                    let _ = stream.flush();
+                    hold_released = true;
+                }
                 let _ = writeln!(stream, "state");
                 let _ = stream.flush();
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
-                while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    let trimmed = line.trim().to_string();
-                    if !trimmed.is_empty() {
-                        push_log(&state, &app, trimmed.clone());
-                        if trimmed.contains("CONNECTED,SUCCESS")
-                            || trimmed.contains("Initialization Sequence Completed")
-                        {
-                            let mut status = current_status(&state);
-                            status.phase = ConnPhase::Connected;
-                            status.message = "Connected".into();
-                            set_status(&state, &app, status);
-                        }
-                        if trimmed.contains("AUTH_FAILED") {
-                            let mut status = current_status(&state);
-                            status.phase = ConnPhase::Error;
-                            status.message = "Authentication failed".into();
-                            set_status(&state, &app, status);
-                        }
-                        if trimmed.starts_with(">PASSWORD:") {
-                            let mut status = current_status(&state);
-                            status.message = format!("Auth challenge: {trimmed}");
-                            set_status(&state, &app, status);
-                            let _ = app.emit("portal://auth-challenge", trimmed.clone());
-                        }
-                    }
+                // Bound reads so a stuck socket cannot freeze this worker.
+                for _ in 0..32 {
                     line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim().to_string();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            push_log(&state_bg, &app_bg, trimmed.clone());
+                            if trimmed.contains("CONNECTED,SUCCESS")
+                                || trimmed.contains("Initialization Sequence Completed")
+                            {
+                                let mut status = current_status(&state_bg);
+                                status.phase = ConnPhase::Connected;
+                                status.message = "Connected".into();
+                                set_status(&state_bg, &app_bg, status);
+                            }
+                            if trimmed.contains("AUTH_FAILED") {
+                                let mut status = current_status(&state_bg);
+                                status.phase = ConnPhase::Error;
+                                status.message = "Authentication failed".into();
+                                set_status(&state_bg, &app_bg, status);
+                            }
+                            if trimmed.starts_with(">PASSWORD:") {
+                                let mut status = current_status(&state_bg);
+                                status.message = format!("Auth challenge: {trimmed}");
+                                set_status(&state_bg, &app_bg, status);
+                                let _ = app_bg.emit("portal://auth-challenge", trimmed);
+                            }
+                        }
+                        Err(_) => break,
+                    }
                     if stop_flag.load(Ordering::SeqCst) {
                         break;
                     }
                 }
             }
-            // Child exit detection
+
             let exited = {
-                let mut guard = state.lock().ok();
+                let mut guard = state_bg.lock().ok();
                 if let Some(ref mut g) = guard {
                     if let Some(ref mut child) = g.child {
                         matches!(child.try_wait(), Ok(Some(_)))
                     } else {
-                        true
+                        false
                     }
                 } else {
                     true
                 }
             };
             if exited {
-                let mut status = current_status(&state);
+                let mut status = current_status(&state_bg);
                 if status.phase == ConnPhase::Connected || status.phase == ConnPhase::Connecting {
                     status.phase = ConnPhase::Error;
                     status.message = "OpenVPN process ended".into();
-                    set_status(&state, &app, status);
+                    set_status(&state_bg, &app_bg, status);
                 }
                 break;
             }
             if started.elapsed() > Duration::from_secs(3600 * 24) {
                 break;
             }
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(400));
         }
     });
 
@@ -471,6 +541,7 @@ fn management_release_hold(port: u16) -> Result<(), String> {
 }
 
 fn spawn_openvpn(bin: &Path, args: &[String], elevate: bool) -> Result<Child, String> {
+    // Never pipe stdout/stderr without a reader: a full pipe freezes OpenVPN and the UI.
     #[cfg(target_os = "linux")]
     {
         if elevate {
@@ -481,8 +552,8 @@ fn spawn_openvpn(bin: &Path, args: &[String], elevate: bool) -> Result<Child, St
             }
             return cmd
                 .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn()
                 .map_err(|e| {
                     format!(
@@ -495,8 +566,6 @@ fn spawn_openvpn(bin: &Path, args: &[String], elevate: bool) -> Result<Child, St
     #[cfg(target_os = "windows")]
     {
         if elevate {
-            // Best-effort: run via PowerShell Start-Process -Verb RunAs is async and hard to pipe.
-            // Spawn openvpn directly; user may need admin shell for TUN. Document in README.
             let _ = elevate;
         }
     }
@@ -504,7 +573,6 @@ fn spawn_openvpn(bin: &Path, args: &[String], elevate: bool) -> Result<Child, St
     #[cfg(target_os = "macos")]
     {
         if elevate {
-            // Best-effort: try direct spawn; Network Extension not in v0.1.
             let _ = elevate;
         }
     }
@@ -512,8 +580,8 @@ fn spawn_openvpn(bin: &Path, args: &[String], elevate: bool) -> Result<Child, St
     Command::new(bin)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("Could not start bundled OpenVPN: {e}"))
 }

@@ -443,8 +443,11 @@ pub fn portal_logs(tunnel: State<'_, SharedTunnel>) -> Result<Vec<String>, Strin
 }
 
 #[tauri::command]
-pub fn disconnect_vpn(app: AppHandle, tunnel: State<'_, SharedTunnel>) -> Result<(), String> {
-    disconnect_tunnel(&tunnel, &app)
+pub async fn disconnect_vpn(app: AppHandle, tunnel: State<'_, SharedTunnel>) -> Result<(), String> {
+    let state = tunnel.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || disconnect_tunnel(&state, &app))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -520,7 +523,6 @@ pub fn connect_vpn(
         None
     };
 
-    // Key passphrase via management challenge if needed; stored in session for challenge handler
     if let Some(pass) = &req.key_passphrase {
         if !pass.is_empty() {
             let mut map = session.lock().map_err(|e| e.to_string())?;
@@ -535,6 +537,7 @@ pub fn connect_vpn(
     let profile_id = profile.id.clone();
     save_profiles_disk(&file).map_err(|e| e.to_string())?;
 
+    // Returns after spawning a worker; pkexec / kill-switch never block the UI thread.
     connect_tunnel(
         tunnel.inner().clone(),
         app,
