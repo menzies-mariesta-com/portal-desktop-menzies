@@ -12,7 +12,7 @@ export const portalDiskSettingsSchema = z.object({
 	killSwitch: z.boolean().default(false),
 	credentialStore: z.enum(['keyring', 'session']).default('keyring'),
 	elevateOnConnect: z.boolean().default(true),
-	trayEnabled: z.boolean().default(false)
+	trayEnabled: z.boolean().default(true)
 });
 
 export type PortalDiskSettings = z.infer<typeof portalDiskSettingsSchema>;
@@ -83,9 +83,14 @@ export async function connectionStatus(): Promise<ConnStatus> {
 	return connStatusSchema.parse(raw);
 }
 
+/** Max connection-log blocks kept in UI and Rust ring buffer. */
+export const MAX_CONNECTION_LOG_BLOCKS = 20;
+
 export async function portalLogs(): Promise<string[]> {
 	if (!isTauri()) return [];
-	return invoke<string[]>('portal_logs');
+	const lines = await invoke<string[]>('portal_logs');
+	// Keep last N mockup-code blocks (matches Rust MAX_LOG_BLOCKS).
+	return lines.slice(-MAX_CONNECTION_LOG_BLOCKS);
 }
 
 export async function connectVpn(payload: {

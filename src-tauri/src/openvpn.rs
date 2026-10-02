@@ -13,7 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
-const MAX_LOG_LINES: usize = 2000;
+/// Keep only the latest N mockup-code log blocks so an open Connection log tab cannot freeze.
+const MAX_LOG_BLOCKS: usize = 20;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -212,8 +213,8 @@ fn pick_management_port() -> u16 {
 fn push_log(state: &SharedTunnel, app: &AppHandle, line: String) {
     if let Ok(mut guard) = state.lock() {
         guard.log_lines.push(line.clone());
-        if guard.log_lines.len() > MAX_LOG_LINES {
-            let overflow = guard.log_lines.len() - MAX_LOG_LINES;
+        if guard.log_lines.len() > MAX_LOG_BLOCKS {
+            let overflow = guard.log_lines.len() - MAX_LOG_BLOCKS;
             guard.log_lines.drain(0..overflow);
         }
     }
@@ -224,7 +225,8 @@ fn set_status(state: &SharedTunnel, app: &AppHandle, status: ConnStatus) {
     if let Ok(mut guard) = state.lock() {
         guard.status = status.clone();
     }
-    let _ = app.emit("portal://status", status);
+    let _ = app.emit("portal://status", status.clone());
+    crate::tray::on_connection_status(app, &status);
 }
 
 pub fn current_status(state: &SharedTunnel) -> ConnStatus {

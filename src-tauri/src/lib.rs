@@ -1,13 +1,18 @@
 //! Portal desktop Menzies: Tauri entry, OpenVPN profiles, and connection manager.
+//!
+//! Lifecycle: the main window close button hides to the system tray. Tray Quit
+//! tears down the in-app tunnel then exits. The app does not scan the OS for
+//! already-running OpenVPN processes on startup.
 
 mod openvpn;
 mod paths;
 mod portal;
+mod tray;
 
 use openvpn::new_shared_tunnel;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -21,6 +26,9 @@ pub fn run() {
                 log::warn!("could not create Menzies app dirs: {err}");
             }
 
+            // Do not discover or reclaim foreign OpenVPN processes here.
+            // Tunnel state starts Idle; only Portal-spawned children are tracked.
+
             #[cfg(desktop)]
             {
                 app.handle()
@@ -29,29 +37,14 @@ pub fn run() {
 
             #[cfg(all(desktop, not(target_os = "android"), not(target_os = "ios")))]
             {
-                use tauri::menu::{MenuBuilder, MenuItemBuilder};
-                use tauri::tray::TrayIconBuilder;
-                let settings = portal::load_portal_settings().unwrap_or_default();
-                if settings.tray_enabled {
-                    let show = MenuItemBuilder::with_id("show", "Show Portal").build(app)?;
-                    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
-                    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
-                    let _tray = TrayIconBuilder::new()
-                        .menu(&menu)
-                        .tooltip("Portal")
-                        .on_menu_event(|app, event| match event.id.as_ref() {
-                            "show" => {
-                                if let Some(w) = app.get_webview_window("main") {
-                                    let _ = w.show();
-                                    let _ = w.set_focus();
-                                }
-                            }
-                            "quit" => {
-                                app.exit(0);
-                            }
-                            _ => {}
-                        })
-                        .build(app)?;
+                match tray::setup_tray(app.handle()) {
+                    Ok(icon) => {
+                        // Keep the tray alive for the process lifetime.
+                        app.manage(icon);
+                    }
+                    Err(err) => {
+                        log::error!("failed to create system tray: {err}");
+                    }
                 }
             }
 
@@ -64,6 +57,13 @@ pub fn run() {
             }
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // Hide to tray instead of destroying the window / quitting.
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             paths::app_paths,

@@ -18,7 +18,7 @@ import { __iconNode as refreshCw } from 'lucide-react/dist/esm/icons/refresh-cw.
 import { __iconNode as scrollText } from 'lucide-react/dist/esm/icons/scroll-text.mjs';
 import { __iconNode as search } from 'lucide-react/dist/esm/icons/search.mjs';
 import { __iconNode as settings } from 'lucide-react/dist/esm/icons/settings.mjs';
-import { __iconNode as shield } from 'lucide-react/dist/esm/icons/shield.mjs';
+import { __iconNode as shieldKeyhole } from 'lucide-react/dist/esm/icons/shield-keyhole.mjs';
 import { __iconNode as square } from 'lucide-react/dist/esm/icons/square.mjs';
 import { __iconNode as sun } from 'lucide-react/dist/esm/icons/sun.mjs';
 import { __iconNode as trash2 } from 'lucide-react/dist/esm/icons/trash-2.mjs';
@@ -39,7 +39,7 @@ export const washIcons = {
 	check,
 	search,
 	settings,
-	shield,
+	'shield-keyhole': shieldKeyhole,
 	plug,
 	unplug,
 	gauge,

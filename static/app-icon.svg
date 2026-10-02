@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Menzies Portal">
-  <!-- Lucide Shield + music water-block (blotches + mist). Ink #1A3A48. No hairline outline. -->
+  <!-- Lucide ShieldKeyhole + music water-block (blotches + mist). Ink #1A3A48. No hairline outline. -->
   <defs>
     <filter id="splash-edge" x="-50%" y="-50%" width="200%" height="200%" color-interpolation-filters="sRGB">
       <feTurbulence type="fractalNoise" baseFrequency="0.035" numOctaves="4" seed="7" result="noise"/>
@@ -50,8 +50,8 @@
     <circle cx="210" cy="230" r="80" fill="#F2E1C6" opacity="0.35" filter="url(#soft-blur)"/>
     <circle cx="300" cy="290" r="70" fill="#E8C9C3" opacity="0.28" filter="url(#soft-blur)"/>
 
-    <!-- Lucide Shield, scale 17.2 ≈ 80.6%. Stroke 2.6 mineral ink, fill none except hub dot, no hairline. -->
-        <g
+    <!-- Lucide ShieldKeyhole, scale 17.2 ≈ 80.6%. Stroke 2.6 mineral ink, fill none, no hairline. -->
+    <g
       transform="translate(256 256) scale(17.2) translate(-12 -12)"
       fill="none"
       stroke="#1A3A48"
@@ -59,7 +59,9 @@
       stroke-linecap="round"
       stroke-linejoin="round"
     >
+      <path d="M12 13v3"/>
       <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>
+      <circle cx="12" cy="11" r="2"/>
     </g>
   </g>
 </svg>

@@ -29,7 +29,9 @@
 | load/save_portal_settings                       | Preferences               |
 | clear/has credentials                           | Keyring + session         |
 
-Events: `portal://status`, `portal://log`, `portal://auth-challenge`.
+Events: `portal://status`, `portal://log`, `portal://auth-challenge`, `portal://traffic`, tray UI events.
+
+Connection log: Rust `TunnelState.log_lines` is a ring buffer of the latest **20** blocks (mockup-code lines). The FE also caps at 20 when appending or reloading so an open log tab cannot grow without bound.
 
 ## OpenVPN
 
@@ -57,3 +59,18 @@ Webview is untrusted for secrets display only. Rust holds credentials transientl
 ## One tunnel
 
 Shared `TunnelState` mutex rejects a second connect while connecting or connected.
+
+## Window and tray lifecycle
+
+- Closing the main window **hides** it. The process stays alive with an always-on system tray icon.
+- Tray menu: Connect (recent portals submenu), Disconnect, Reconnect, Show stats, read-only VPN IP label, Show Portal, Quit.
+- Connect / Disconnect / Reconnect are status-driven (disabled, not hidden):
+  - Idle or Error: Connect enabled; Disconnect and Reconnect disabled
+  - Connecting or Reconnecting: Disconnect enabled; Connect and Reconnect disabled
+  - Connected: Disconnect and Reconnect enabled; Connect disabled
+- VPN IP is a disabled menu label (`VPN IP: {addr}` or `VPN IP: n/a`), not an action.
+- Tray icon keeps the product mark and paints a corner status badge (idle slate, connecting ochre, connected green, error rose). Linux and Windows show full-color tray icons; menu item status dots depend on the desktop shell. macOS template monochrome is not used so the badge stays visible.
+- Status changes rebuild enable/disable, IP text, tooltip, and badge via `tray::on_connection_status`.
+- Tray Quit calls `disconnect_tunnel` for the in-app session, then `app.exit`.
+- Startup does **not** scan the OS for foreign OpenVPN processes. Only Portal-spawned tunnels are tracked.
+- Tray icon is kept via `app.manage(tray)` so it is not dropped at end of setup. A PNG icon is required for reliable visibility on Linux StatusNotifier.

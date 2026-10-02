@@ -21,6 +21,7 @@
 		isTauri,
 		listProfiles,
 		loadPortalSettings,
+		MAX_CONNECTION_LOG_BLOCKS,
 		portalLogs,
 		renameProfile,
 		respondAuthChallenge,
@@ -363,6 +364,7 @@
 		if (!settings) return;
 		busy = true;
 		try {
+			settings.trayEnabled = true;
 			await savePortalSettings(settings);
 			showToast('success', m.settings_saved());
 			settingsOpen = false;
@@ -404,6 +406,9 @@
 		let unlistenLog: (() => void) | undefined;
 		let unlistenChallenge: (() => void) | undefined;
 		let unlistenTraffic: (() => void) | undefined;
+		let unlistenTrayStats: (() => void) | undefined;
+		let unlistenTrayToast: (() => void) | undefined;
+		let unlistenTrayAuth: (() => void) | undefined;
 		if (isTauri()) {
 			void listen<ConnStatus>('portal://status', (event) => {
 				const prev = status.phase;
@@ -439,7 +444,7 @@
 			void listen<string>('portal://log', (event) => {
 				// Only print into the log panel while that tab is open.
 				if (detailTab !== 'log') return;
-				logs = [...logs, event.payload].slice(-2000);
+				logs = [...logs, event.payload].slice(-MAX_CONNECTION_LOG_BLOCKS);
 			}).then((fn) => {
 				unlistenLog = fn;
 			});
@@ -462,6 +467,23 @@
 			}).then((fn) => {
 				unlistenChallenge = fn;
 			});
+			void listen('portal://tray-show-stats', () => {
+				focusConnectedProfile();
+			}).then((fn) => {
+				unlistenTrayStats = fn;
+			});
+			void listen<string>('portal://tray-toast', (event) => {
+				showToast('error', event.payload);
+			}).then((fn) => {
+				unlistenTrayToast = fn;
+			});
+			void listen<string>('portal://tray-needs-auth', (event) => {
+				const profile = profiles.find((p) => p.id === event.payload);
+				showToast('info', m.tray_needs_auth());
+				if (profile) void beginConnect(profile);
+			}).then((fn) => {
+				unlistenTrayAuth = fn;
+			});
 		}
 
 		const tick = setInterval(() => {
@@ -477,6 +499,9 @@
 			unlistenLog?.();
 			unlistenChallenge?.();
 			unlistenTraffic?.();
+			unlistenTrayStats?.();
+			unlistenTrayToast?.();
+			unlistenTrayAuth?.();
 			clearInterval(tick);
 		};
 	});
@@ -488,7 +513,7 @@
 
 {#if !onboarded}
 	<div class="bg-base-100 flex flex-1 flex-col items-center justify-center gap-4 p-8 text-center">
-		<WashIcon icon={washIcons.shield} class="text-primary size-16" />
+		<WashIcon icon={washIcons['shield-keyhole']} class="text-primary size-16" />
 		<h1 class="font-display text-2xl font-semibold">{m.onboard_title()}</h1>
 		<p class="text-base-content/70 max-w-lg text-sm leading-relaxed">{m.onboard_body()}</p>
 		<button type="button" class="btn btn-primary cursor-pointer" onclick={completeOnboarding}
@@ -560,7 +585,7 @@
 								class:active={selectedId === profile.id}
 								onclick={() => (selectedId = profile.id)}
 							>
-								<WashIcon icon={washIcons.shield} class="size-4 shrink-0 opacity-70" />
+								<WashIcon icon={washIcons['shield-keyhole']} class="size-4 shrink-0 opacity-70" />
 								<span class="min-w-0 flex-1 truncate text-start">{profile.name}</span>
 							</button>
 						</li>
@@ -1029,16 +1054,7 @@
 					}}
 				/>
 			</div>
-			<label class="mt-2 flex cursor-pointer items-center justify-between gap-2 text-sm">
-				<span>{m.setting_tray()}</span>
-				<input
-					type="checkbox"
-					class="toggle"
-					checked={settings.trayEnabled}
-					onchange={(e) =>
-						settings && (settings.trayEnabled = (e.currentTarget as HTMLInputElement).checked)}
-				/>
-			</label>
+			<p class="text-base-content/70 mt-3 text-sm">{m.setting_tray()}</p>
 			<p class="text-base-content/50 mt-2 text-xs">{m.setting_kill_switch_hint()}</p>
 			<div class="modal-action">
 				<button type="button" class="btn cursor-pointer" onclick={() => (settingsOpen = false)}

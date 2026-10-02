@@ -25,4 +25,9 @@ describe('portal schemas', () => {
 		expect(st.vpnIp).toBe('10.8.0.2');
 		expect(st.phase).toBe('connected');
 	});
+
+	it('exports connection log block cap', async () => {
+		const { MAX_CONNECTION_LOG_BLOCKS } = await import('./portal-ipc');
+		expect(MAX_CONNECTION_LOG_BLOCKS).toBe(20);
+	});
 });

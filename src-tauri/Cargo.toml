@@ -22,7 +22,7 @@ dirs = "6"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
-tauri = { version = "2.11.3", features = ["tray-icon"] }
+tauri = { version = "2.11.3", features = ["tray-icon", "image-png"] }
 tauri-plugin-log = "2"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-dialog = "2"

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 const SETTINGS_FILE: &str = "settings.json";
@@ -52,7 +52,7 @@ impl Default for PortalDiskSettings {
             kill_switch: false,
             credential_store: "keyring".into(),
             elevate_on_connect: true,
-            tray_enabled: false,
+            tray_enabled: true,
         }
     }
 }
@@ -355,16 +355,17 @@ pub fn list_profiles() -> Result<Vec<ProfileSummary>, String> {
 }
 
 #[tauri::command]
-pub fn import_ovpn_file(path: String) -> Result<ProfileSummary, String> {
+pub fn import_ovpn_file(app: AppHandle, path: String) -> Result<ProfileSummary, String> {
     let summary = import_one_ovpn(Path::new(&path)).map_err(|e| e.to_string())?;
     let mut file = load_profiles_disk().map_err(|e| e.to_string())?;
     file.profiles.push(summary.clone());
     save_profiles_disk(&file).map_err(|e| e.to_string())?;
+    crate::tray::refresh_recent_menu(&app);
     Ok(summary)
 }
 
 #[tauri::command]
-pub fn import_ovpn_folder(path: String) -> Result<Vec<ProfileSummary>, String> {
+pub fn import_ovpn_folder(app: AppHandle, path: String) -> Result<Vec<ProfileSummary>, String> {
     let root = PathBuf::from(&path);
     if !root.is_dir() {
         return Err("Path is not a directory".into());
@@ -382,6 +383,7 @@ pub fn import_ovpn_folder(path: String) -> Result<Vec<ProfileSummary>, String> {
         }
     }
     save_profiles_disk(&file).map_err(|e| e.to_string())?;
+    crate::tray::refresh_recent_menu(&app);
     Ok(imported)
 }
 
@@ -410,7 +412,11 @@ fn walkdir_ovpn(root: &Path) -> Vec<PathBuf> {
 }
 
 #[tauri::command]
-pub fn delete_profile(id: String, session: State<'_, SessionSecrets>) -> Result<(), String> {
+pub fn delete_profile(
+    app: AppHandle,
+    id: String,
+    session: State<'_, SessionSecrets>,
+) -> Result<(), String> {
     let mut file = load_profiles_disk().map_err(|e| e.to_string())?;
     file.profiles.retain(|p| p.id != id);
     save_profiles_disk(&file).map_err(|e| e.to_string())?;
@@ -419,17 +425,20 @@ pub fn delete_profile(id: String, session: State<'_, SessionSecrets>) -> Result<
         fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
     }
     let _ = clear_credentials(&id, &session);
+    crate::tray::refresh_recent_menu(&app);
     Ok(())
 }
 
 #[tauri::command]
-pub fn rename_profile(id: String, name: String) -> Result<(), String> {
+pub fn rename_profile(app: AppHandle, id: String, name: String) -> Result<(), String> {
     let mut file = load_profiles_disk().map_err(|e| e.to_string())?;
     let Some(profile) = file.profiles.iter_mut().find(|p| p.id == id) else {
         return Err("Profile not found".into());
     };
     profile.name = name;
-    save_profiles_disk(&file).map_err(|e| e.to_string())
+    save_profiles_disk(&file).map_err(|e| e.to_string())?;
+    crate::tray::refresh_recent_menu(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -540,7 +549,7 @@ pub fn connect_vpn(
     // Returns after spawning a worker; pkexec / kill-switch never block the UI thread.
     connect_tunnel(
         tunnel.inner().clone(),
-        app,
+        app.clone(),
         ConnectArgs {
             profile_id,
             config_path: cfg,
@@ -548,7 +557,9 @@ pub fn connect_vpn(
             kill_switch: settings.kill_switch,
             elevate: settings.elevate_on_connect,
         },
-    )
+    )?;
+    crate::tray::refresh_recent_menu(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -565,4 +576,50 @@ pub fn has_stored_credentials(
     session: State<'_, SessionSecrets>,
 ) -> Result<bool, String> {
     Ok(load_credentials(&id, &session)?.is_some())
+}
+
+/// Recent profiles for the tray Connect submenu (most recently used first).
+pub fn recent_profiles(limit: usize) -> Vec<ProfileSummary> {
+    let mut profiles = load_profiles_disk().map(|f| f.profiles).unwrap_or_default();
+    profiles.sort_by(|a, b| {
+        b.last_used_ms
+            .unwrap_or(0)
+            .cmp(&a.last_used_ms.unwrap_or(0))
+            .then_with(|| b.created_ms.cmp(&a.created_ms))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    profiles.truncate(limit);
+    profiles
+}
+
+pub fn tray_disconnect(app: &AppHandle) -> Result<(), String> {
+    let tunnel = app.state::<SharedTunnel>().inner().clone();
+    disconnect_tunnel(&tunnel, app)
+}
+
+pub fn tray_connect(app: &AppHandle, profile_id: &str) -> Result<(), String> {
+    let tunnel = app.state::<SharedTunnel>();
+    let session = app.state::<SessionSecrets>();
+    let req = ConnectRequest {
+        profile_id: profile_id.to_string(),
+        username: None,
+        password: None,
+        key_passphrase: None,
+        remember: false,
+        store: None,
+    };
+    connect_vpn(app.clone(), tunnel, session, req)?;
+    crate::tray::refresh_recent_menu(app);
+    Ok(())
+}
+
+pub fn tray_reconnect(app: &AppHandle) -> Result<(), String> {
+    let tunnel = app.state::<SharedTunnel>().inner().clone();
+    let status = openvpn::current_status(&tunnel);
+    let profile_id = status
+        .profile_id
+        .clone()
+        .ok_or_else(|| "No active portal to reconnect".to_string())?;
+    disconnect_tunnel(&tunnel, app)?;
+    tray_connect(app, &profile_id)
 }

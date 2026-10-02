@@ -161,12 +161,13 @@
 		onpointerdown={startDrag}
 		role="presentation"
 	>
-		<span class="inline-flex max-w-full items-baseline gap-1 overflow-visible pb-0.5">
+		<span class="inline-flex max-w-full items-baseline gap-1 overflow-visible">
 			<span
-				class="font-display text-base-content text-sm leading-normal font-semibold tracking-wide whitespace-nowrap"
+				class="font-display text-base-content text-sm font-semibold tracking-wide whitespace-nowrap"
 				>{m.app_title()}</span
 			>
-			<span class="shrink-0 pe-1.5 pt-[0.15em] text-[0.65em] leading-none italic opacity-50"
+			<span
+				class="relative top-[0.15em] shrink-0 pe-1.5 text-[0.65em] leading-none italic opacity-50"
 				>{APP_VERSION}</span
 			>
 		</span>
@@ -196,7 +197,7 @@
 				aria-label={isConnected ? m.focus_connected() : m.status_not_connected()}
 				onclick={() => requestFocusConnected()}
 			>
-				<WashIcon icon={washIcons.shield} class="size-4" />
+				<WashIcon icon={washIcons['shield-keyhole']} class="size-4" />
 			</button>
 		</div>
 	</div>
@@ -272,22 +273,30 @@
 							>
 						</li>
 					</ul>
-					<p class="text-base-content/60 px-2 pt-2 pb-1 text-xs font-medium">
+					<div class="border-ink-border/40 my-1 border-t"></div>
+					<p class="text-base-content/60 px-2 py-1 text-xs font-medium">
 						{m.theme_pigment_section()}
 					</p>
 				</div>
 				<ul
-					class="menu menu-sm flex min-h-0 w-full flex-1 flex-col flex-nowrap overflow-x-hidden overflow-y-auto p-0"
+					class="menu menu-sm flex min-h-0 w-full flex-1 flex-col flex-nowrap overflow-x-hidden overflow-y-auto overscroll-contain p-0"
 				>
 					{#each watercolorThemes as item (item.id)}
-						<li role="none">
+						<li role="none" class="w-full">
 							<button
 								type="button"
-								class="cursor-pointer capitalize"
+								class="w-full cursor-pointer"
 								class:active={pigment === item.id}
 								role="menuitem"
-								onclick={() => choosePigment(item.id)}>{item.label}</button
+								onclick={() => choosePigment(item.id)}
 							>
+								<span
+									class="border-ink-border size-3.5 shrink-0 rounded-full border"
+									style="background: radial-gradient(circle at 35% 30%, color-mix(in oklab, white 70%, transparent) 0%, {item.swatch} 60%, color-mix(in oklab, {item.swatch} 70%, black) 100%)"
+									aria-hidden="true"
+								></span>
+								<span class="min-w-0 truncate">{item.label}</span>
+							</button>
 						</li>
 					{/each}
 				</ul>
@@ -295,52 +304,71 @@
 		{/if}
 
 		<div
+			class="{washRecipes.tooltipIcon('primary', 'bottom')} relative z-[220]"
+			data-tip={updating ? m.update_checking() : m.downloads()}
+		>
+			<button
+				type="button"
+				class="btn btn-ghost btn-square btn-sm btn-primary"
+				class:cursor-pointer={!updating}
+				class:cursor-not-allowed={updating}
+				class:cursor-wait={updating}
+				class:loading={updating}
+				class:btn-disabled={updating}
+				disabled={updating}
+				aria-busy={updating}
+				aria-label={updating ? m.update_checking() : m.downloads()}
+				onclick={onDownloads}
+			>
+				<WashIcon icon={washIcons.download} class="size-4" />
+			</button>
+		</div>
+
+		<div
 			class="{washRecipes.tooltipIcon('secondary', 'bottom')} relative z-[220]"
-			data-tip={m.downloads()}
+			data-tip={m.window_minimize()}
 		>
 			<button
 				type="button"
 				class="btn btn-ghost btn-square btn-sm btn-secondary cursor-pointer"
-				class:loading={updating}
-				disabled={updating}
-				aria-busy={updating}
-				aria-label={m.downloads()}
-				onclick={onDownloads}
+				aria-label={m.window_minimize()}
+				onclick={minimize}
 			>
-				{#if !updating}
-					<WashIcon icon={washIcons.download} class="size-4" />
+				<WashIcon icon={washIcons.minus} class="size-3.5" />
+			</button>
+		</div>
+
+		<div
+			class="{washRecipes.tooltipIcon('secondary', 'bottom')} relative z-[220]"
+			data-tip={maximized ? m.window_restore() : m.window_maximize()}
+		>
+			<button
+				type="button"
+				class="btn btn-ghost btn-square btn-sm btn-secondary cursor-pointer"
+				aria-label={maximized ? m.window_restore() : m.window_maximize()}
+				onclick={toggleMaximize}
+			>
+				{#if maximized}
+					<WashIcon icon={washIcons.copy} class="size-3.5" />
+				{:else}
+					<WashIcon icon={washIcons.square} class="size-3.5" />
 				{/if}
 			</button>
 		</div>
 
-		<button
-			type="button"
-			class="btn btn-ghost btn-square btn-sm cursor-pointer"
-			aria-label={m.window_minimize()}
-			onclick={minimize}
+		<div
+			class="{washRecipes.tooltipIcon('error', 'bottom')} relative z-[220]"
+			data-tip={m.window_close()}
 		>
-			<WashIcon icon={washIcons.minus} class="size-3.5" />
-		</button>
-		<button
-			type="button"
-			class="btn btn-ghost btn-square btn-sm cursor-pointer"
-			aria-label={maximized ? m.window_restore() : m.window_maximize()}
-			onclick={toggleMaximize}
-		>
-			{#if maximized}
-				<WashIcon icon={washIcons.copy} class="size-3.5" />
-			{:else}
-				<WashIcon icon={washIcons.square} class="size-3.5" />
-			{/if}
-		</button>
-		<button
-			type="button"
-			class="btn btn-ghost btn-square btn-sm btn-error cursor-pointer"
-			aria-label={m.window_close()}
-			onclick={close}
-		>
-			<WashIcon icon={washIcons.x} class="size-3.5" />
-		</button>
+			<button
+				type="button"
+				class="btn btn-ghost btn-square btn-sm btn-error cursor-pointer"
+				aria-label={m.window_close()}
+				onclick={close}
+			>
+				<WashIcon icon={washIcons.x} class="size-3.5" />
+			</button>
+		</div>
 	</div>
 </header>
 

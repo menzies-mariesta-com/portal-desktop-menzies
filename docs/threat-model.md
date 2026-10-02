@@ -18,7 +18,7 @@
 
 ## Capabilities
 
-Dialog (import), process exit/restart, updater, window chrome. No shell allowlist for arbitrary commands. Connect uses fixed bundled OpenVPN path plus pkexec.
+Dialog (import), process exit/restart, updater, window chrome, system tray. No shell allowlist for arbitrary commands. Connect uses fixed bundled OpenVPN path plus pkexec. Window close hides to tray; tray Quit tears down the Portal-owned tunnel then exits. Startup does not scan for foreign OpenVPN processes.
 
 ## Update channel
 
