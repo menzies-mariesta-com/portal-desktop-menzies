@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+- Close to tray while Quit disconnects the tunnel and exits
+- Lucide ShieldKeyhole water-block product icon set
+- Status-driven tray Connect, Disconnect, and Reconnect with read-only VPN IP
+- Cap the connection log at 20 blocks
+- Align Appearance dropdown with sibling desktop apps
+
 ## 0.1.2
 
 - Preserve OpenVPN arch subdirs in the Linux bundle (map directory, not flatten glob)
