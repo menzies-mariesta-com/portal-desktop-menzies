@@ -37,6 +37,10 @@ pub fn profiles_dir() -> Result<PathBuf, PathError> {
     Ok(data_dir()?.join("profiles"))
 }
 
+pub fn gp_profiles_dir() -> Result<PathBuf, PathError> {
+    Ok(data_dir()?.join("gp-profiles"))
+}
+
 pub fn runtime_dir() -> Result<PathBuf, PathError> {
     Ok(data_dir()?.join("runtime"))
 }
@@ -48,6 +52,7 @@ pub fn ensure_app_dirs() -> Result<AppPaths, PathError> {
     fs::create_dir_all(&data)?;
     fs::create_dir_all(data.join("logs"))?;
     fs::create_dir_all(data.join("profiles"))?;
+    fs::create_dir_all(data.join("gp-profiles"))?;
     fs::create_dir_all(data.join("runtime"))?;
     Ok(AppPaths {
         config_dir: config.to_string_lossy().into_owned(),

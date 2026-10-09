@@ -1,14 +1,19 @@
-//! Portal desktop Menzies: Tauri entry, OpenVPN profiles, and connection manager.
+//! Portal desktop Menzies: Tauri entry, OpenVPN + GlobalProtect, dual tunnels.
 //!
 //! Lifecycle: the main window close button hides to the system tray. Tray Quit
-//! tears down the in-app tunnel then exits. The app does not scan the OS for
-//! already-running OpenVPN processes on startup.
+//! tears down in-app tunnels then exits. The app does not scan the OS for
+//! already-running VPN processes on startup.
 
+mod connect_queue;
+mod globalprotect;
+mod kill_switch;
 mod openvpn;
 mod paths;
 mod portal;
 mod tray;
 
+use connect_queue::new_connect_queue;
+use globalprotect::new_shared_gp_tunnel;
 use openvpn::new_shared_tunnel;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -20,14 +25,13 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(new_shared_tunnel())
+        .manage(new_shared_gp_tunnel())
+        .manage(new_connect_queue())
         .manage(Mutex::new(HashMap::<String, (String, String)>::new()))
         .setup(|app| {
             if let Err(err) = paths::ensure_app_dirs() {
                 log::warn!("could not create Menzies app dirs: {err}");
             }
-
-            // Do not discover or reclaim foreign OpenVPN processes here.
-            // Tunnel state starts Idle; only Portal-spawned children are tracked.
 
             #[cfg(desktop)]
             {
@@ -39,7 +43,6 @@ pub fn run() {
             {
                 match tray::setup_tray(app.handle()) {
                     Ok(icon) => {
-                        // Keep the tray alive for the process lifetime.
                         app.manage(icon);
                     }
                     Err(err) => {
@@ -60,7 +63,6 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                // Hide to tray instead of destroying the window / quitting.
                 api.prevent_close();
                 let _ = window.hide();
             }
@@ -81,6 +83,18 @@ pub fn run() {
             portal::respond_auth_challenge,
             portal::clear_profile_credentials,
             portal::has_stored_credentials,
+            portal::connect_gp,
+            globalprotect::list_gp_profiles,
+            globalprotect::save_gp_profile,
+            globalprotect::delete_gp_profile,
+            globalprotect::rename_gp_profile,
+            globalprotect::gp_connection_status,
+            globalprotect::gp_logs,
+            globalprotect::disconnect_gp_cmd,
+            globalprotect::respond_gp_auth,
+            globalprotect::pick_gp_path,
+            globalprotect::has_gp_stored_credentials,
+            globalprotect::clear_gp_credentials_cmd,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| {

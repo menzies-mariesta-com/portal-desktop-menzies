@@ -17,6 +17,7 @@
 //! stays visible). Menu item icons use the same status color dots where the DE
 //! paints custom menu icons (support varies by Linux shell).
 
+use crate::globalprotect::{self, SharedGpTunnel};
 use crate::openvpn::{self, ConnPhase, ConnStatus, SharedTunnel};
 use crate::portal;
 use std::sync::Mutex;
@@ -30,6 +31,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 const RECENT_LIMIT: usize = 8;
 const CONNECT_PREFIX: &str = "connect:";
+const CONNECT_GP_PREFIX: &str = "connect-gp:";
 
 /// Wash-aligned semantic colors for tray status (RGB).
 const COLOR_IDLE: (u8, u8, u8) = (0x64, 0x74, 0x8B);
@@ -145,13 +147,24 @@ fn icon_with_status_badge(base: &Image<'static>, rgb: (u8, u8, u8)) -> Image<'st
     Image::new_owned(rgba, w, h)
 }
 
+fn combined_phase(ovpn: &ConnPhase, gp: &ConnPhase) -> ConnPhase {
+    use ConnPhase::*;
+    for p in [Connected, Connecting, Reconnecting, Error] {
+        if *ovpn == p || *gp == p {
+            return p;
+        }
+    }
+    Idle
+}
+
 fn build_connect_submenu(
     app: &AppHandle,
     connect_enabled: bool,
 ) -> tauri::Result<Submenu<tauri::Wry>> {
     let mut builder = SubmenuBuilder::with_id(app, "connect", "Connect").enabled(connect_enabled);
     let recent = portal::recent_profiles(RECENT_LIMIT);
-    if recent.is_empty() {
+    let gp_recent = globalprotect::recent_gp_profiles(RECENT_LIMIT);
+    if recent.is_empty() && gp_recent.is_empty() {
         let empty = MenuItemBuilder::with_id("connect:none", "No recent portals")
             .enabled(false)
             .build(app)?;
@@ -159,7 +172,16 @@ fn build_connect_submenu(
     } else {
         for profile in recent {
             let id = format!("{CONNECT_PREFIX}{}", profile.id);
-            let item = MenuItemBuilder::with_id(id, &profile.name)
+            let label = format!("OVPN: {}", profile.name);
+            let item = MenuItemBuilder::with_id(id, label)
+                .enabled(connect_enabled)
+                .build(app)?;
+            builder = builder.item(&item);
+        }
+        for profile in gp_recent {
+            let id = format!("{CONNECT_GP_PREFIX}{}", profile.id);
+            let label = format!("GP: {}", profile.name);
+            let item = MenuItemBuilder::with_id(id, label)
                 .enabled(connect_enabled)
                 .build(app)?;
             builder = builder.item(&item);
@@ -184,7 +206,8 @@ fn refresh_connect_submenu(app: &AppHandle, connect_enabled: bool) {
         }
     }
     let recent = portal::recent_profiles(RECENT_LIMIT);
-    if recent.is_empty() {
+    let gp_recent = globalprotect::recent_gp_profiles(RECENT_LIMIT);
+    if recent.is_empty() && gp_recent.is_empty() {
         if let Ok(empty) = MenuItemBuilder::with_id("connect:none", "No recent portals")
             .enabled(false)
             .build(app)
@@ -195,7 +218,18 @@ fn refresh_connect_submenu(app: &AppHandle, connect_enabled: bool) {
     }
     for profile in recent {
         let id = format!("{CONNECT_PREFIX}{}", profile.id);
-        if let Ok(item) = MenuItemBuilder::with_id(id, &profile.name)
+        let label = format!("OVPN: {}", profile.name);
+        if let Ok(item) = MenuItemBuilder::with_id(id, label)
+            .enabled(connect_enabled)
+            .build(app)
+        {
+            let _ = submenu.append(&item);
+        }
+    }
+    for profile in gp_recent {
+        let id = format!("{CONNECT_GP_PREFIX}{}", profile.id);
+        let label = format!("GP: {}", profile.name);
+        if let Ok(item) = MenuItemBuilder::with_id(id, label)
             .enabled(connect_enabled)
             .build(app)
         {
@@ -288,31 +322,70 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         "show" => show_main(app),
         "disconnect" => {
+            let mut err_msg = None;
             if let Err(err) = portal::tray_disconnect(app) {
+                err_msg = Some(err);
+            }
+            if let Err(err) = portal::tray_disconnect_gp(app) {
+                err_msg = Some(err);
+            }
+            if let Some(err) = err_msg {
                 log::warn!("tray disconnect failed: {err}");
                 let _ = app.emit("portal://tray-toast", format!("Disconnect failed: {err}"));
             }
             refresh_for_current_status(app);
         }
         "reconnect" => {
-            if let Err(err) = portal::tray_reconnect(app) {
+            let ovpn_status = openvpn::current_status(&app.state::<SharedTunnel>());
+            let gp_status = globalprotect::current_gp_status(&app.state::<SharedGpTunnel>());
+            let mut err_msg = None;
+            if matches!(
+                ovpn_status.phase,
+                ConnPhase::Connected | ConnPhase::Connecting | ConnPhase::Reconnecting
+            ) {
+                if let Err(err) = portal::tray_reconnect(app) {
+                    err_msg = Some(err);
+                }
+            }
+            if matches!(
+                gp_status.phase,
+                ConnPhase::Connected | ConnPhase::Connecting | ConnPhase::Reconnecting
+            ) {
+                if let Err(err) = portal::tray_reconnect_gp(app) {
+                    err_msg = Some(err);
+                }
+            }
+            if let Some(err) = err_msg {
                 log::warn!("tray reconnect failed: {err}");
                 show_main(app);
                 let _ = app.emit("portal://tray-toast", err);
-            } else {
-                refresh_for_current_status(app);
             }
+            refresh_for_current_status(app);
         }
         "show_stats" => {
             show_main(app);
             let _ = app.emit("portal://tray-show-stats", ());
         }
-        "vpn_ip" => {
-            // Read-only label; clicks should not fire when disabled.
-        }
+        "vpn_ip" => {}
         "quit" => {
             let _ = portal::tray_disconnect(app);
+            let _ = portal::tray_disconnect_gp(app);
             app.exit(0);
+        }
+        other if other.starts_with(CONNECT_GP_PREFIX) => {
+            let profile_id = &other[CONNECT_GP_PREFIX.len()..];
+            if profile_id.is_empty() || profile_id == "none" {
+                return;
+            }
+            match portal::tray_connect_gp(app, profile_id) {
+                Ok(()) => refresh_for_current_status(app),
+                Err(err) => {
+                    log::warn!("tray GP connect failed: {err}");
+                    show_main(app);
+                    let _ = app.emit("portal://tray-toast", err);
+                    refresh_for_current_status(app);
+                }
+            }
         }
         other if other.starts_with(CONNECT_PREFIX) => {
             let profile_id = &other[CONNECT_PREFIX.len()..];
@@ -439,13 +512,23 @@ fn apply_status_ui(app: &AppHandle, status: &ConnStatus) {
 
 /// Refresh tray enable/disable, IP label, and status badge from live tunnel state.
 pub fn refresh_for_current_status(app: &AppHandle) {
-    let status = openvpn::current_status(&app.state::<SharedTunnel>());
-    apply_status_ui(app, &status);
+    let ovpn = openvpn::current_status(&app.state::<SharedTunnel>());
+    let gp = globalprotect::current_gp_status(&app.state::<SharedGpTunnel>());
+    let mut merged = ovpn.clone();
+    merged.phase = combined_phase(&ovpn.phase, &gp.phase);
+    if merged.vpn_ip.is_none() {
+        merged.vpn_ip = gp.vpn_ip.clone();
+    }
+    if matches!(gp.phase, ConnPhase::Connected) && !matches!(ovpn.phase, ConnPhase::Connected) {
+        merged.vpn_ip = gp.vpn_ip.clone().or(ovpn.vpn_ip.clone());
+        merged.message = gp.message.clone();
+    }
+    apply_status_ui(app, &merged);
 }
 
-/// Called whenever connection status changes (from OpenVPN manager).
-pub fn on_connection_status(app: &AppHandle, status: &ConnStatus) {
-    apply_status_ui(app, status);
+/// Called whenever either protocol connection status changes.
+pub fn on_connection_status(app: &AppHandle, _status: &ConnStatus) {
+    refresh_for_current_status(app);
 }
 
 /// Refresh the Connect submenu after profile import/delete/connect.

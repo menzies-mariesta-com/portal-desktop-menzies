@@ -12,65 +12,69 @@
 
 - Config: `{config}/menzies/com.mariesta.menzies.portal-desktop-menzies/` (`settings.json`)
 - Data: `{data}/menzies/com.mariesta.menzies.portal-desktop-menzies/`
-  - `profiles.json` index
+  - `profiles.json` index (OpenVPN)
   - `profiles/{id}/config.ovpn` + sidecars
+  - `gp-profiles.json` index (GlobalProtect)
+  - `gp-profiles/{id}/meta.json` + categorical path references
   - `runtime/*.auth` (0600)
   - `logs/`
 
+## Settings
+
+Nested protocol settings with `activeUiProtocol` (`openvpn` | `globalprotect`). Legacy flat settings migrate into `openvpn` on load.
+
+## Dual tunnels
+
+OpenVPN and GlobalProtect each have an independent tunnel slot. Both may be connected at once. Connect/disconnect jobs share a serial queue so elevate and kill-switch mutations do not race. Order follows activation order.
+
 ## IPC map
 
-| Command                                         | Role                      |
-| ----------------------------------------------- | ------------------------- |
-| import_ovpn_file / import_ovpn_folder           | Copy and index profiles   |
-| list_profiles / delete_profile / rename_profile | Profile CRUD              |
-| connect_vpn / disconnect_vpn                    | Tunnel lifecycle          |
-| connection_status / portal_logs                 | UI state                  |
-| respond_auth_challenge                          | MFA / management password |
-| load/save_portal_settings                       | Preferences               |
-| clear/has credentials                           | Keyring + session         |
+| Command                                         | Role                                    |
+| ----------------------------------------------- | --------------------------------------- |
+| import_ovpn_file / import_ovpn_folder           | Copy and index OpenVPN profiles         |
+| list_profiles / delete_profile / rename_profile | OpenVPN profile CRUD                    |
+| connect_vpn / disconnect_vpn                    | OpenVPN tunnel lifecycle                |
+| connection_status / portal_logs                 | OpenVPN UI state                        |
+| respond_auth_challenge                          | OpenVPN MFA / management password       |
+| list/save/delete/rename_gp_profile              | GlobalProtect profile CRUD              |
+| connect_gp / disconnect_gp                      | GlobalProtect via bundled gpclient      |
+| gp_connection_status / gp_logs                  | GlobalProtect UI state                  |
+| pick_gp_path                                    | Categorical cert/key/HIP/cookie pickers |
+| respond_gp_auth                                 | GlobalProtect MFA prompt store          |
+| load/save_portal_settings                       | Nested preferences                      |
+| clear/has credentials (OVPN + GP)               | Keyring + session                       |
 
-Events: `portal://status`, `portal://log`, `portal://auth-challenge`, `portal://traffic`, tray UI events.
+Events: `portal://status`, `portal://gp-status`, `portal://log`, `portal://gp-log`, `portal://auth-challenge`, `portal://gp-auth-challenge`, `portal://traffic`, tray UI events.
 
-Connection log: Rust `TunnelState.log_lines` is a ring buffer of the latest **20** blocks (mockup-code lines). The FE also caps at 20 when appending or reloading so an open log tab cannot grow without bound.
+Connection log: ring buffer of the latest **20** blocks per protocol.
 
 ## OpenVPN
 
-Source tree: `src-tauri/resources/openvpn/{platform}/openvpn` (e.g. `linux-x86_64`).
+Source tree: `src-tauri/resources/openvpn/{platform}/openvpn`.
 
-### Bundle layout (Linux deb/rpm)
+`PORTAL_OPENVPN_BIN` overrides for development. Connect on Linux uses `pkexec` when elevate is enabled. Management interface on localhost.
 
-`tauri.conf.json` maps directories (not map-globs), so arch subdirs are preserved:
+## GlobalProtect
 
-| Source                   | Installed path                                         |
-| ------------------------ | ------------------------------------------------------ |
-| `resources/openvpn/`     | `$RESOURCE/openvpn/` (e.g. `/usr/lib/Portal/openvpn/`) |
-| `…/linux-x86_64/openvpn` | `$RESOURCE/openvpn/linux-x86_64/openvpn`               |
+Source tree: `src-tauri/resources/gpclient/{platform}/gpclient` and `gpauth`.
 
-`$RESOURCE` is Tauri `resource_dir()` (productName folder under `/usr/lib` for deb). Runtime resolution in `openvpn.rs` checks `resource_dir` then `openvpn/` then a flat `openvpn/openvpn` fallback for older flattened packages. `PORTAL_OPENVPN_BIN` overrides for development only.
+`PORTAL_GPCLIENT_BIN` / `PORTAL_GPAUTH_BIN` override for development. `scripts/fetch-gpclient.sh` copies PATH binaries or builds from `PORTAL_GPOC_SRC`. Auth modes: password, system browser SSO, embedded webview (`gpauth`), client cert, mixed. Cookie cache, HIP, gateway selection, and advanced OpenConnect flags map to `gpclient connect` args.
 
-Do not use map form `"resources/openvpn/**/*": "openvpn/"`: Tauri flattens map-globs and drops `linux-x86_64/`.
+## Kill switch
 
-Connect on Linux uses `pkexec` when elevate is enabled. Management interface on localhost for hold release, state, and challenges.
+Linux nftables table `portal_ks` via pkexec. Shared across protocols: allows loopback, established, ICMP, and VPN ifnames (`tun*`, `tap*`, `gpd*`, plus registered slots). Unregister per protocol on disconnect; clear when none remain.
 
 ## Privilege trust boundary
 
-Webview is untrusted for secrets display only. Rust holds credentials transiently, keyring for persistence. Helper elevation is polkit (Linux), UAC/best-effort (Windows), admin/best-effort (macOS). Never falls back to system OpenVPN on PATH.
-
-## One tunnel
-
-Shared `TunnelState` mutex rejects a second connect while connecting or connected.
+Webview is untrusted for secrets display only. Rust holds credentials transiently, keyring for persistence. Helper elevation is polkit (Linux), UAC/best-effort (Windows), admin/best-effort (macOS). Production never falls back to system OpenVPN or gpclient on PATH (env overrides are for development).
 
 ## Window and tray lifecycle
 
-- Closing the main window **hides** it. The process stays alive with an always-on system tray icon.
-- Tray menu: Connect (recent portals submenu), Disconnect, Reconnect, Show stats, read-only VPN IP label, Show Portal, Quit.
-- Connect / Disconnect / Reconnect are status-driven (disabled, not hidden):
-  - Idle or Error: Connect enabled; Disconnect and Reconnect disabled
-  - Connecting or Reconnecting: Disconnect enabled; Connect and Reconnect disabled
-  - Connected: Disconnect and Reconnect enabled; Connect disabled
-- VPN IP is a disabled menu label (`VPN IP: {addr}` or `VPN IP: n/a`), not an action.
-- Tray icon keeps the product mark and paints a corner status badge (idle slate, connecting ochre, connected green, error rose). Linux and Windows show full-color tray icons; menu item status dots depend on the desktop shell. macOS template monochrome is not used so the badge stays visible.
-- Status changes rebuild enable/disable, IP text, tooltip, and badge via `tray::on_connection_status`.
-- Tray Quit calls `disconnect_tunnel` for the in-app session, then `app.exit`.
-- Startup does **not** scan the OS for foreign OpenVPN processes. Only Portal-spawned tunnels are tracked.
-- Tray icon is kept via `app.manage(tray)` so it is not dropped at end of setup. A PNG icon is required for reliable visibility on Linux StatusNotifier.
+- Closing the main window **hides** it. Tray stays alive.
+- Titlebar: dual status icons (OpenVPN + GlobalProtect); clickable when that protocol is active; focuses mode and profile.
+- Tray Connect submenu lists recent OVPN and GP profiles. Disconnect/Reconnect/Quit operate on both slots as needed.
+- Status badge merges phases (connected preferred).
+
+## Bundle resources
+
+`tauri.conf.json` maps `resources/openvpn/` and `resources/gpclient/` as directories (not flattened globs).

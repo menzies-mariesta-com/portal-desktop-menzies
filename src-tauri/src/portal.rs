@@ -1,5 +1,10 @@
 //! Portal profiles, settings, credentials, and VPN commands.
 
+use crate::connect_queue::{ProtocolSlot, SerialConnectQueue};
+use crate::globalprotect::{
+    self, connect_gp_tunnel, load_gp_credentials, store_gp_credentials, GpConnectArgs,
+    GpConnectRequest, SharedGpTunnel,
+};
 use crate::openvpn::{
     self, connect_tunnel, disconnect_tunnel, send_management_auth, ConnStatus, ConnectArgs,
     SharedTunnel,
@@ -33,28 +38,94 @@ pub enum PortalError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PortalDiskSettings {
-    pub onboarded: bool,
+pub struct ProtocolSettings {
     pub auto_connect_profile_id: Option<String>,
     pub reconnect_on_drop: bool,
     pub kill_switch: bool,
     pub credential_store: String,
     pub elevate_on_connect: bool,
+}
+
+impl Default for ProtocolSettings {
+    fn default() -> Self {
+        Self {
+            auto_connect_profile_id: None,
+            reconnect_on_drop: false,
+            kill_switch: false,
+            credential_store: "keyring".into(),
+            elevate_on_connect: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpProtocolSettings {
+    pub auto_connect_profile_id: Option<String>,
+    pub reconnect_on_drop: bool,
+    pub kill_switch: bool,
+    pub credential_store: String,
+    pub elevate_on_connect: bool,
+    pub cookie_cache_enabled: bool,
+    pub default_browser_mode: String,
+    pub ignore_tls_errors: bool,
+    pub fix_openssl: bool,
+    pub default_os: String,
+}
+
+impl Default for GpProtocolSettings {
+    fn default() -> Self {
+        Self {
+            auto_connect_profile_id: None,
+            reconnect_on_drop: false,
+            kill_switch: false,
+            credential_store: "keyring".into(),
+            elevate_on_connect: true,
+            cookie_cache_enabled: true,
+            default_browser_mode: "auto".into(),
+            ignore_tls_errors: false,
+            fix_openssl: false,
+            default_os: "Linux".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortalDiskSettings {
+    pub onboarded: bool,
     pub tray_enabled: bool,
+    pub active_ui_protocol: String,
+    pub openvpn: ProtocolSettings,
+    pub globalprotect: GpProtocolSettings,
 }
 
 impl Default for PortalDiskSettings {
     fn default() -> Self {
         Self {
             onboarded: false,
-            auto_connect_profile_id: None,
-            reconnect_on_drop: false,
-            kill_switch: false,
-            credential_store: "keyring".into(),
-            elevate_on_connect: true,
             tray_enabled: true,
+            active_ui_protocol: "openvpn".into(),
+            openvpn: ProtocolSettings::default(),
+            globalprotect: GpProtocolSettings::default(),
         }
     }
+}
+
+/// Legacy flat settings (pre dual-mode).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyPortalSettings {
+    onboarded: Option<bool>,
+    auto_connect_profile_id: Option<String>,
+    reconnect_on_drop: Option<bool>,
+    kill_switch: Option<bool>,
+    credential_store: Option<String>,
+    elevate_on_connect: Option<bool>,
+    tray_enabled: Option<bool>,
+    active_ui_protocol: Option<String>,
+    openvpn: Option<ProtocolSettings>,
+    globalprotect: Option<GpProtocolSettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,7 +188,36 @@ fn load_settings_disk() -> Result<PortalDiskSettings, PortalError> {
         return Ok(PortalDiskSettings::default());
     }
     let raw = fs::read_to_string(&path)?;
-    serde_json::from_str(&raw).map_err(|_| PortalError::InvalidJson)
+    if let Ok(settings) = serde_json::from_str::<PortalDiskSettings>(&raw) {
+        return Ok(settings);
+    }
+    let legacy: LegacyPortalSettings =
+        serde_json::from_str(&raw).map_err(|_| PortalError::InvalidJson)?;
+    let mut openvpn = legacy.openvpn.unwrap_or_default();
+    if openvpn.auto_connect_profile_id.is_none() {
+        openvpn.auto_connect_profile_id = legacy.auto_connect_profile_id;
+    }
+    if let Some(v) = legacy.reconnect_on_drop {
+        openvpn.reconnect_on_drop = v;
+    }
+    if let Some(v) = legacy.kill_switch {
+        openvpn.kill_switch = v;
+    }
+    if let Some(v) = legacy.credential_store {
+        openvpn.credential_store = v;
+    }
+    if let Some(v) = legacy.elevate_on_connect {
+        openvpn.elevate_on_connect = v;
+    }
+    Ok(PortalDiskSettings {
+        onboarded: legacy.onboarded.unwrap_or(false),
+        tray_enabled: legacy.tray_enabled.unwrap_or(true),
+        active_ui_protocol: legacy
+            .active_ui_protocol
+            .unwrap_or_else(|| "openvpn".into()),
+        openvpn,
+        globalprotect: legacy.globalprotect.unwrap_or_default(),
+    })
 }
 
 fn save_settings_disk(settings: &PortalDiskSettings) -> Result<(), PortalError> {
@@ -269,9 +369,40 @@ fn import_one_ovpn(path: &Path) -> Result<ProfileSummary, PortalError> {
     })
 }
 
+pub fn format_keyring_error(e: &keyring::Error) -> String {
+    let detail = e.to_string();
+    if detail.contains("DBus")
+        || detail.contains("Did not receive a reply")
+        || detail.contains("Secret Service")
+        || detail.contains("zbus")
+    {
+        format!(
+            "OS keyring is unavailable (Secret Service timed out or is locked). \
+             Open Settings and set credential store to This session only, or unlock your login keyring. \
+             Detail: {detail}"
+        )
+    } else {
+        format!("Platform secure storage failure: {detail}")
+    }
+}
+
 fn keyring_entry(profile_id: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new("com.mariesta.menzies.portal-desktop-menzies", profile_id)
-        .map_err(|e| e.to_string())
+        .map_err(|e| format_keyring_error(&e))
+}
+
+fn store_credentials_in_session(
+    profile_id: &str,
+    username: &str,
+    password: &str,
+    session: &SessionSecrets,
+) -> Result<(), String> {
+    let mut map = session.lock().map_err(|e| e.to_string())?;
+    map.insert(
+        profile_id.to_string(),
+        (username.to_string(), password.to_string()),
+    );
+    Ok(())
 }
 
 fn store_credentials(
@@ -282,18 +413,20 @@ fn store_credentials(
     session: &SessionSecrets,
 ) -> Result<(), String> {
     if store == "session" {
-        let mut map = session.lock().map_err(|e| e.to_string())?;
-        map.insert(
-            profile_id.to_string(),
-            (username.to_string(), password.to_string()),
-        );
-        return Ok(());
+        return store_credentials_in_session(profile_id, username, password, session);
     }
     let entry = keyring_entry(profile_id)?;
     let payload = serde_json::json!({ "username": username, "password": password });
-    entry
-        .set_password(&payload.to_string())
-        .map_err(|e| e.to_string())
+    match entry.set_password(&payload.to_string()) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log::warn!(
+                "OpenVPN keyring store failed; keeping credentials in session only: {}",
+                e
+            );
+            store_credentials_in_session(profile_id, username, password, session)
+        }
+    }
 }
 
 fn load_credentials(
@@ -306,7 +439,13 @@ fn load_credentials(
             return Ok(Some(pair.clone()));
         }
     }
-    let entry = keyring_entry(profile_id)?;
+    let entry = match keyring_entry(profile_id) {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!("OpenVPN keyring entry unavailable: {e}");
+            return Ok(None);
+        }
+    };
     match entry.get_password() {
         Ok(raw) => {
             let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
@@ -323,7 +462,10 @@ fn load_credentials(
             Ok(Some((u, p)))
         }
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.to_string()),
+        Err(e) => {
+            log::warn!("OpenVPN keyring read failed: {e}");
+            Ok(None)
+        }
     }
 }
 
@@ -478,9 +620,11 @@ pub fn connect_vpn(
     app: AppHandle,
     tunnel: State<'_, SharedTunnel>,
     session: State<'_, SessionSecrets>,
+    queue: State<'_, SerialConnectQueue>,
     req: ConnectRequest,
 ) -> Result<(), String> {
     let settings = load_settings_disk().map_err(|e| e.to_string())?;
+    let ovpn = settings.openvpn;
     let mut file = load_profiles_disk().map_err(|e| e.to_string())?;
     let profile = file
         .profiles
@@ -515,7 +659,7 @@ pub fn connect_vpn(
         let store = req
             .store
             .clone()
-            .unwrap_or_else(|| settings.credential_store.clone());
+            .unwrap_or_else(|| ovpn.credential_store.clone());
         if req.remember {
             store_credentials(&req.profile_id, &username, &password, &store, &session)?;
         }
@@ -546,19 +690,128 @@ pub fn connect_vpn(
     let profile_id = profile.id.clone();
     save_profiles_disk(&file).map_err(|e| e.to_string())?;
 
-    // Returns after spawning a worker; pkexec / kill-switch never block the UI thread.
-    connect_tunnel(
-        tunnel.inner().clone(),
-        app.clone(),
-        ConnectArgs {
-            profile_id,
-            config_path: cfg,
-            auth_user_pass_path: auth_path,
-            kill_switch: settings.kill_switch,
-            elevate: settings.elevate_on_connect,
-        },
-    )?;
-    crate::tray::refresh_recent_menu(&app);
+    let tunnel_state = tunnel.inner().clone();
+    let app_clone = app.clone();
+    let kill_switch = ovpn.kill_switch;
+    let elevate = ovpn.elevate_on_connect;
+    queue.enqueue(ProtocolSlot::OpenVpn, move || {
+        let _ = connect_tunnel(
+            tunnel_state,
+            app_clone.clone(),
+            ConnectArgs {
+                profile_id,
+                config_path: cfg,
+                auth_user_pass_path: auth_path,
+                kill_switch,
+                elevate,
+            },
+        );
+        crate::tray::refresh_recent_menu(&app_clone);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn connect_gp(
+    app: AppHandle,
+    tunnel: State<'_, SharedGpTunnel>,
+    session: State<'_, SessionSecrets>,
+    queue: State<'_, SerialConnectQueue>,
+    req: GpConnectRequest,
+) -> Result<(), String> {
+    let settings = load_settings_disk().map_err(|e| e.to_string())?;
+    let gp_settings = settings.globalprotect;
+    let mut profiles = globalprotect::load_gp_profiles_disk().map_err(|e| e.to_string())?;
+    let profile = profiles
+        .iter_mut()
+        .find(|p| p.id == req.profile_id)
+        .ok_or_else(|| "GlobalProtect profile not found".to_string())?;
+
+    if profile.portal.trim().is_empty() {
+        return Err("Portal host is required before connecting".into());
+    }
+
+    let mut username = req
+        .username
+        .clone()
+        .or_else(|| profile.username.clone())
+        .unwrap_or_default();
+    let mut password = req.password.clone().unwrap_or_default();
+    if username.is_empty() || password.is_empty() {
+        if let Some((u, p)) = load_gp_credentials(&req.profile_id, &session)? {
+            if username.is_empty() {
+                username = u;
+            }
+            if password.is_empty() {
+                password = p;
+            }
+        }
+    }
+
+    let auth_mode = profile.auth_mode.as_str();
+    if matches!(auth_mode, "password" | "mixed") && (username.is_empty() || password.is_empty()) {
+        // Browser / cert modes may proceed without password.
+        if auth_mode == "password" {
+            return Err("Username and password are required for this profile".into());
+        }
+    }
+
+    let store = req
+        .store
+        .clone()
+        .unwrap_or_else(|| gp_settings.credential_store.clone());
+    if req.remember && !username.is_empty() && !password.is_empty() {
+        store_gp_credentials(&req.profile_id, &username, &password, &store, &session)?;
+    }
+
+    if let Some(pass) = &req.key_passphrase {
+        if !pass.is_empty() {
+            let mut map = session.lock().map_err(|e| e.to_string())?;
+            map.insert(
+                format!("gp::{}::key", req.profile_id),
+                (String::new(), pass.clone()),
+            );
+        }
+    }
+
+    profile.last_used_ms = Some(now_ms());
+    if !username.is_empty() {
+        profile.username = Some(username.clone());
+    }
+    let profile_clone = profile.clone();
+    globalprotect::save_gp_profiles_disk_pub(&profiles).map_err(|e| e.to_string())?;
+
+    let key_pass = req.key_passphrase.clone().or_else(|| {
+        session.lock().ok().and_then(|map| {
+            map.get(&format!("gp::{}::key", req.profile_id))
+                .map(|(_, p)| p.clone())
+        })
+    });
+
+    let tunnel_state = tunnel.inner().clone();
+    let app_clone = app.clone();
+    let gateway = req.gateway.clone();
+    queue.enqueue(ProtocolSlot::GlobalProtect, move || {
+        let _ = connect_gp_tunnel(
+            tunnel_state,
+            app_clone.clone(),
+            GpConnectArgs {
+                profile: profile_clone,
+                username,
+                password,
+                key_passphrase: key_pass,
+                kill_switch: gp_settings.kill_switch,
+                elevate: gp_settings.elevate_on_connect,
+                cookie_cache: gp_settings.cookie_cache_enabled,
+                ignore_tls: gp_settings.ignore_tls_errors,
+                fix_openssl: gp_settings.fix_openssl,
+                default_os: gp_settings.default_os,
+                default_browser: gp_settings.default_browser_mode,
+                gateway_override: gateway,
+            },
+        );
+        crate::tray::refresh_recent_menu(&app_clone);
+    });
     Ok(())
 }
 
@@ -600,6 +853,7 @@ pub fn tray_disconnect(app: &AppHandle) -> Result<(), String> {
 pub fn tray_connect(app: &AppHandle, profile_id: &str) -> Result<(), String> {
     let tunnel = app.state::<SharedTunnel>();
     let session = app.state::<SessionSecrets>();
+    let queue = app.state::<SerialConnectQueue>();
     let req = ConnectRequest {
         profile_id: profile_id.to_string(),
         username: None,
@@ -608,9 +862,45 @@ pub fn tray_connect(app: &AppHandle, profile_id: &str) -> Result<(), String> {
         remember: false,
         store: None,
     };
-    connect_vpn(app.clone(), tunnel, session, req)?;
+    connect_vpn(app.clone(), tunnel, session, queue, req)?;
     crate::tray::refresh_recent_menu(app);
     Ok(())
+}
+
+pub fn tray_connect_gp(app: &AppHandle, profile_id: &str) -> Result<(), String> {
+    let tunnel = app.state::<SharedGpTunnel>();
+    let session = app.state::<SessionSecrets>();
+    let queue = app.state::<SerialConnectQueue>();
+    let req = GpConnectRequest {
+        profile_id: profile_id.to_string(),
+        username: None,
+        password: None,
+        key_passphrase: None,
+        remember: false,
+        store: None,
+        gateway: None,
+    };
+    connect_gp(app.clone(), tunnel, session, queue, req)?;
+    crate::tray::refresh_recent_menu(app);
+    Ok(())
+}
+
+pub fn tray_disconnect_gp(app: &AppHandle) -> Result<(), String> {
+    let tunnel = app.state::<SharedGpTunnel>().inner().clone();
+    globalprotect::disconnect_gp(&tunnel, app)
+}
+
+pub fn tray_reconnect_gp(app: &AppHandle) -> Result<(), String> {
+    let tunnel = app.state::<SharedGpTunnel>().inner().clone();
+    let status = globalprotect::current_gp_status(&tunnel);
+    let profile_id = status
+        .profile_id
+        .clone()
+        .ok_or_else(|| "No active GlobalProtect portal to reconnect".to_string())?;
+    globalprotect::disconnect_gp(&tunnel, app)?;
+    // Brief settle so the kernel releases tun before the next elevated connect.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    tray_connect_gp(app, &profile_id)
 }
 
 pub fn tray_reconnect(app: &AppHandle) -> Result<(), String> {

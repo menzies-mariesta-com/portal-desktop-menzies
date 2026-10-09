@@ -15,6 +15,7 @@
 		connectionStatus,
 		deleteProfile,
 		disconnectVpn,
+		gpConnectionStatus,
 		hasStoredCredentials,
 		importOvpnFile,
 		importOvpnFolder,
@@ -28,17 +29,37 @@
 		savePortalSettings,
 		type ConnStatus,
 		type PortalDiskSettings,
-		type ProfileSummary
+		type ProfileSummary,
+		type VpnProtocol
 	} from '$lib/tool/portal-ipc';
 	import { loadSettings, saveSettings } from '$lib/store/local-storage/settings';
 	import { parsePortalLogLine } from '$lib/tool/portal-log-line';
+	import GpPad from '$lib/tool/GpPad.svelte';
 
 	let profiles = $state<ProfileSummary[]>([]);
 	let selectedId = $state<string | null>(null);
 	let query = $state('');
-	let status = $state<ConnStatus>({ phase: 'idle', message: '' });
+	let status = $state<ConnStatus>({
+		phase: 'idle',
+		message: '',
+		protocol: 'openvpn',
+		interfaceName: null
+	});
+	let gpStatus = $state<ConnStatus>({
+		phase: 'idle',
+		message: '',
+		protocol: 'globalprotect',
+		interfaceName: null
+	});
+	let activeProtocol = $state<VpnProtocol>('openvpn');
+	let settingsProtocol = $state<VpnProtocol>('openvpn');
+	let gpFocusId = $state<string | null>(null);
 	let logs = $state<string[]>([]);
 	let settings = $state<PortalDiskSettings | null>(null);
+	let gpPadRef = $state<{
+		reload?: () => Promise<void>;
+		focusProfile?: (id: string) => void;
+	} | null>(null);
 	let busy = $state(false);
 	let toast = $state<{ tone: 'success' | 'error' | 'info' | 'warning'; text: string } | null>(null);
 	let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -151,11 +172,33 @@
 		return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
 	}
 
-	function focusConnectedProfile() {
+	function focusConnectedProfile(protocol?: VpnProtocol) {
+		const proto = protocol ?? activeProtocol;
+		if (proto === 'globalprotect') {
+			activeProtocol = 'globalprotect';
+			if (gpStatus.profileId) {
+				gpFocusId = gpStatus.profileId;
+				gpPadRef?.focusProfile?.(gpStatus.profileId);
+			}
+			return;
+		}
+		activeProtocol = 'openvpn';
 		if (!status.profileId) return;
 		selectedId = status.profileId;
 		query = '';
 		detailTab = 'performance';
+	}
+
+	async function setUiProtocol(next: VpnProtocol) {
+		activeProtocol = next;
+		if (settings) {
+			settings = { ...settings, activeUiProtocol: next };
+			try {
+				await savePortalSettings(settings);
+			} catch {
+				/* ignore */
+			}
+		}
 	}
 
 	async function openLogTab() {
@@ -171,18 +214,29 @@
 		try {
 			profiles = await listProfiles();
 			status = await connectionStatus();
+			gpStatus = await gpConnectionStatus();
 			if (detailTab === 'log') {
 				logs = await portalLogs();
 			}
 			settings = await loadPortalSettings();
 			if (settings) {
-				authStore = settings.credentialStore;
+				activeProtocol = settings.activeUiProtocol;
+				authStore = settings.openvpn.credentialStore;
 			}
 			if (!selectedId && profiles[0]) selectedId = profiles[0].id;
+			await gpPadRef?.reload?.();
 		} catch (err) {
 			showToast('error', err instanceof Error ? err.message : String(err));
 		}
 	}
+
+	const protoSettings = $derived(
+		settings
+			? settingsProtocol === 'globalprotect'
+				? settings.globalprotect
+				: settings.openvpn
+			: null
+	);
 
 	async function onImportFile() {
 		if (!isTauri()) {
@@ -365,6 +419,7 @@
 		busy = true;
 		try {
 			settings.trayEnabled = true;
+			settings.activeUiProtocol = activeProtocol;
 			await savePortalSettings(settings);
 			showToast('success', m.settings_saved());
 			settingsOpen = false;
@@ -390,19 +445,25 @@
 		const unsub = subscribePortalRefresh(() => {
 			void refreshAll();
 		});
-		const unsubFocus = subscribeFocusConnected(() => {
-			focusConnectedProfile();
+		const unsubFocus = subscribeFocusConnected((payload) => {
+			focusConnectedProfile(payload?.protocol);
 		});
 		void refreshAll().then(async () => {
 			if (!settings) return;
-			const autoId = settings.autoConnectProfileId;
+			const autoId = settings.openvpn.autoConnectProfileId;
 			if (autoId && status.phase === 'idle') {
 				const profile = profiles.find((p) => p.id === autoId);
 				if (profile) await beginConnect(profile);
 			}
+			const gpAuto = settings.globalprotect.autoConnectProfileId;
+			if (gpAuto && gpStatus.phase === 'idle') {
+				activeProtocol = 'globalprotect';
+				gpFocusId = gpAuto;
+			}
 		});
 
 		let unlistenStatus: (() => void) | undefined;
+		let unlistenGpStatus: (() => void) | undefined;
 		let unlistenLog: (() => void) | undefined;
 		let unlistenChallenge: (() => void) | undefined;
 		let unlistenTraffic: (() => void) | undefined;
@@ -412,13 +473,13 @@
 		if (isTauri()) {
 			void listen<ConnStatus>('portal://status', (event) => {
 				const prev = status.phase;
-				status = event.payload;
+				status = { ...event.payload, protocol: 'openvpn' };
 				if (event.payload.phase !== 'connected') {
 					downBps = 0;
 					upBps = 0;
 				}
 				if (
-					settings?.reconnectOnDrop &&
+					settings?.openvpn.reconnectOnDrop &&
 					prev === 'connected' &&
 					event.payload.phase === 'error' &&
 					event.payload.profileId &&
@@ -440,6 +501,16 @@
 				}
 			}).then((fn) => {
 				unlistenStatus = fn;
+			});
+			void listen<ConnStatus>('portal://gp-status', (event) => {
+				const prev = gpStatus.phase;
+				gpStatus = { ...event.payload, protocol: 'globalprotect' };
+				if (event.payload.phase === 'error' && prev !== 'error') {
+					const msg = event.payload.message?.trim();
+					showToast('error', msg && msg.length > 0 ? msg : m.status_error());
+				}
+			}).then((fn) => {
+				unlistenGpStatus = fn;
 			});
 			void listen<string>('portal://log', (event) => {
 				// Only print into the log panel while that tab is open.
@@ -487,8 +558,11 @@
 		}
 
 		const tick = setInterval(() => {
-			if (status.phase === 'connected') {
+			if (status.phase === 'connected' || status.phase === 'connecting') {
 				status = { ...status };
+			}
+			if (gpStatus.phase === 'connected' || gpStatus.phase === 'connecting') {
+				gpStatus = { ...gpStatus };
 			}
 		}, 1000);
 
@@ -496,6 +570,7 @@
 			unsub();
 			unsubFocus();
 			unlistenStatus?.();
+			unlistenGpStatus?.();
 			unlistenLog?.();
 			unlistenChallenge?.();
 			unlistenTraffic?.();
@@ -521,288 +596,334 @@
 		>
 	</div>
 {:else}
-	<div class="flex min-h-0 flex-1 flex-col gap-0 overflow-hidden md:flex-row">
-		<aside
-			class="border-ink-border/15 flex min-h-0 w-full min-w-0 shrink-0 flex-col overflow-hidden border-b md:h-full md:w-72 md:border-r md:border-b-0"
-		>
-			<div class="flex shrink-0 flex-wrap items-center gap-1 p-2">
-				<div class={washRecipes.tooltipIcon('primary', 'bottom')} data-tip={m.import_file()}>
-					<button
-						type="button"
-						class="btn btn-ghost btn-square btn-sm btn-primary cursor-pointer"
-						class:loading={busy}
-						disabled={busy}
-						aria-label={m.import_file()}
-						onclick={onImportFile}
-					>
-						{#if !busy}
-							<WashIcon icon={washIcons['file-plus']} class="size-4" />
-						{/if}
-					</button>
-				</div>
-				<div class={washRecipes.tooltipIcon('primary', 'bottom')} data-tip={m.import_folder()}>
-					<button
-						type="button"
-						class="btn btn-ghost btn-square btn-sm btn-primary cursor-pointer"
-						disabled={busy}
-						aria-label={m.import_folder()}
-						onclick={onImportFolder}
-					>
-						<WashIcon icon={washIcons['folder-open']} class="size-4" />
-					</button>
-				</div>
+	<div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+		<div class="border-ink-border/15 flex shrink-0 items-center gap-2 border-b px-3 py-2">
+			<span class="text-base-content/60 text-xs font-medium tracking-wide uppercase">Mode</span>
+			<div class="join">
+				<button
+					type="button"
+					class="btn join-item btn-sm cursor-pointer"
+					class:btn-primary={activeProtocol === 'openvpn'}
+					class:btn-ghost={activeProtocol !== 'openvpn'}
+					onclick={() => setUiProtocol('openvpn')}>{m.mode_openvpn()}</button
+				>
+				<button
+					type="button"
+					class="btn join-item btn-sm cursor-pointer"
+					class:btn-primary={activeProtocol === 'globalprotect'}
+					class:btn-ghost={activeProtocol !== 'globalprotect'}
+					onclick={() => setUiProtocol('globalprotect')}>{m.mode_globalprotect()}</button
+				>
+			</div>
+			<div class="ml-auto">
 				<div class={washRecipes.tooltipIcon('secondary', 'bottom')} data-tip={m.settings()}>
 					<button
 						type="button"
 						class="btn btn-ghost btn-square btn-sm btn-secondary cursor-pointer"
 						aria-label={m.settings()}
-						onclick={() => (settingsOpen = true)}
+						onclick={() => {
+							settingsProtocol = activeProtocol;
+							settingsOpen = true;
+						}}
 					>
 						<WashIcon icon={washIcons.settings} class="size-4" />
 					</button>
 				</div>
-				<label class="input input-sm input-bordered ml-auto flex min-w-0 flex-1 items-center gap-1">
-					<WashIcon icon={washIcons.search} class="size-3.5 opacity-50" />
-					<input
-						class="min-w-0 grow cursor-text"
-						type="search"
-						placeholder={m.search_profiles()}
-						bind:value={query}
-					/>
-				</label>
 			</div>
-			<ul
-				class="menu menu-sm flex min-h-0 w-full min-w-0 flex-1 flex-col flex-nowrap overflow-x-hidden overflow-y-auto overscroll-contain p-1"
-			>
-				{#if filtered.length === 0}
-					<li class="text-base-content/60 w-full px-2 py-4 text-sm">{m.no_profiles()}</li>
-				{:else}
-					{#each filtered as profile (profile.id)}
-						<li class="w-full min-w-0">
+		</div>
+		{#if activeProtocol === 'globalprotect'}
+			<div class="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
+				<GpPad
+					bind:gpStatus
+					credentialStore={settings?.globalprotect.credentialStore ?? 'keyring'}
+					onToast={showToast}
+					focusProfileId={gpFocusId}
+					bind:this={gpPadRef}
+				/>
+			</div>
+		{:else}
+			<div class="flex min-h-0 flex-1 flex-col gap-0 overflow-hidden md:flex-row">
+				<aside
+					class="border-ink-border/15 flex min-h-0 w-full min-w-0 shrink-0 flex-col overflow-hidden border-b md:h-full md:w-72 md:border-r md:border-b-0"
+				>
+					<div class="flex shrink-0 flex-wrap items-center gap-1 p-2">
+						<div class={washRecipes.tooltipIcon('primary', 'bottom')} data-tip={m.import_file()}>
 							<button
 								type="button"
-								class="flex w-full min-w-0 cursor-pointer items-center gap-2 overflow-hidden"
-								class:active={selectedId === profile.id}
-								onclick={() => (selectedId = profile.id)}
+								class="btn btn-ghost btn-square btn-sm btn-primary cursor-pointer"
+								class:loading={busy}
+								disabled={busy}
+								aria-label={m.import_file()}
+								onclick={onImportFile}
 							>
-								<WashIcon icon={washIcons['shield-keyhole']} class="size-4 shrink-0 opacity-70" />
-								<span class="min-w-0 flex-1 truncate text-start">{profile.name}</span>
+								{#if !busy}
+									<WashIcon icon={washIcons['file-plus']} class="size-4" />
+								{/if}
 							</button>
-						</li>
-					{/each}
-				{/if}
-			</ul>
-		</aside>
-
-		<section class="flex min-h-0 min-w-0 flex-1 flex-col">
-			<div class="border-ink-border/15 flex shrink-0 flex-wrap items-center gap-2 border-b p-3">
-				<div class="min-w-0 flex-1">
-					<p class="font-display text-lg font-semibold">
-						{selected?.name ?? m.no_selection()}
-					</p>
-					<p class="text-base-content/60 truncate text-xs">
-						{selected?.sourcePath ?? ''}
-					</p>
-				</div>
-				{#if selectedNeedsSwitch && selected}
-					<button
-						type="button"
-						class="btn btn-primary btn-sm cursor-pointer"
-						class:loading={busy}
-						disabled={busy}
-						onclick={() => selected && requestConnect(selected)}
+						</div>
+						<div class={washRecipes.tooltipIcon('primary', 'bottom')} data-tip={m.import_folder()}>
+							<button
+								type="button"
+								class="btn btn-ghost btn-square btn-sm btn-primary cursor-pointer"
+								disabled={busy}
+								aria-label={m.import_folder()}
+								onclick={onImportFolder}
+							>
+								<WashIcon icon={washIcons['folder-open']} class="size-4" />
+							</button>
+						</div>
+						<label
+							class="input input-sm input-bordered ml-auto flex min-w-0 flex-1 items-center gap-1"
+						>
+							<WashIcon icon={washIcons.search} class="size-3.5 opacity-50" />
+							<input
+								class="min-w-0 grow cursor-text"
+								type="search"
+								placeholder={m.search_profiles()}
+								bind:value={query}
+							/>
+						</label>
+					</div>
+					<ul
+						class="menu menu-sm flex min-h-0 w-full min-w-0 flex-1 flex-col flex-nowrap overflow-x-hidden overflow-y-auto overscroll-contain p-1"
 					>
-						{#if !busy}
-							<WashIcon icon={washIcons.plug} class="size-4" />
+						{#if filtered.length === 0}
+							<li class="text-base-content/60 w-full px-2 py-4 text-sm">{m.no_profiles()}</li>
+						{:else}
+							{#each filtered as profile (profile.id)}
+								<li class="w-full min-w-0">
+									<button
+										type="button"
+										class="flex w-full min-w-0 cursor-pointer items-center gap-2 overflow-hidden"
+										class:active={selectedId === profile.id}
+										onclick={() => (selectedId = profile.id)}
+									>
+										<WashIcon
+											icon={washIcons['shield-keyhole']}
+											class="size-4 shrink-0 opacity-70"
+										/>
+										<span class="min-w-0 flex-1 truncate text-start">{profile.name}</span>
+									</button>
+								</li>
+							{/each}
 						{/if}
-						{m.connect()}
-					</button>
-				{:else if isActiveSession}
-					<button
-						type="button"
-						class="btn btn-error btn-sm cursor-pointer"
-						class:loading={busy}
-						disabled={busy}
-						onclick={onDisconnect}
-					>
-						{#if !busy}
-							<WashIcon icon={washIcons.unplug} class="size-4" />
+					</ul>
+				</aside>
+
+				<section class="flex min-h-0 min-w-0 flex-1 flex-col">
+					<div class="border-ink-border/15 flex shrink-0 flex-wrap items-center gap-2 border-b p-3">
+						<div class="min-w-0 flex-1">
+							<p class="font-display text-lg font-semibold">
+								{selected?.name ?? m.no_selection()}
+							</p>
+							<p class="text-base-content/60 truncate text-xs">
+								{selected?.sourcePath ?? ''}
+							</p>
+						</div>
+						{#if selectedNeedsSwitch && selected}
+							<button
+								type="button"
+								class="btn btn-primary btn-sm cursor-pointer"
+								class:loading={busy}
+								disabled={busy}
+								onclick={() => selected && requestConnect(selected)}
+							>
+								{#if !busy}
+									<WashIcon icon={washIcons.plug} class="size-4" />
+								{/if}
+								{m.connect()}
+							</button>
+						{:else if isActiveSession}
+							<button
+								type="button"
+								class="btn btn-error btn-sm cursor-pointer"
+								class:loading={busy}
+								disabled={busy}
+								onclick={onDisconnect}
+							>
+								{#if !busy}
+									<WashIcon icon={washIcons.unplug} class="size-4" />
+								{/if}
+								{m.disconnect()}
+							</button>
+						{:else if selected}
+							<button
+								type="button"
+								class="btn btn-primary btn-sm cursor-pointer"
+								class:loading={busy}
+								disabled={busy}
+								onclick={() => selected && requestConnect(selected)}
+							>
+								{#if !busy}
+									<WashIcon icon={washIcons.plug} class="size-4" />
+								{/if}
+								{m.connect()}
+							</button>
 						{/if}
-						{m.disconnect()}
-					</button>
-				{:else if selected}
-					<button
-						type="button"
-						class="btn btn-primary btn-sm cursor-pointer"
-						class:loading={busy}
-						disabled={busy}
-						onclick={() => selected && requestConnect(selected)}
-					>
-						{#if !busy}
-							<WashIcon icon={washIcons.plug} class="size-4" />
-						{/if}
-						{m.connect()}
-					</button>
-				{/if}
-			</div>
-
-			{#if selected}
-				<div class="grid shrink-0 grid-cols-2 gap-2 p-3 text-sm sm:grid-cols-4">
-					<div class="bg-base-200/40 rounded-box p-2">
-						<p class="text-base-content/50 text-xs">{m.status_label()}</p>
-						<p class={profileStatusClass}>{profileStatusLabel}</p>
 					</div>
-					<div class="bg-base-200/40 rounded-box p-2">
-						<p class="text-base-content/50 text-xs">{m.duration_label()}</p>
-						<p class="font-mono">{profileDurationText}</p>
-					</div>
-					<div class="bg-base-200/40 rounded-box p-2">
-						<p class="text-base-content/50 text-xs">{m.vpn_ip_label()}</p>
-						<p class="font-mono">{profileVpnIpText}</p>
-					</div>
-					<div class="bg-base-200/40 rounded-box p-2">
-						<p class="text-base-content/50 text-xs">{m.auth_label()}</p>
-						<p>
-							{selected.needsUserPass ? m.auth_user_pass() : m.auth_cert()}
-						</p>
-					</div>
-				</div>
 
-				<div class="flex shrink-0 flex-wrap items-end gap-2 px-3 pb-2">
-					<label class="form-control w-full max-w-xs">
-						<span class="label-text text-xs">{m.rename_profile()}</span>
-						<input class="input input-bordered input-sm cursor-text" bind:value={renameValue} />
-					</label>
-					<button
-						type="button"
-						class="btn btn-secondary btn-sm cursor-pointer"
-						disabled={busy}
-						onclick={onRename}>{m.rename()}</button
-					>
-					<button
-						type="button"
-						class="btn btn-ghost btn-sm btn-error cursor-pointer"
-						disabled={busy}
-						onclick={() => selected && onDelete(selected.id)}
-					>
-						<WashIcon icon={washIcons['trash-2']} class="size-4" />
-						{m.delete()}
-					</button>
-					<button
-						type="button"
-						class="btn btn-ghost btn-sm cursor-pointer"
-						onclick={() =>
-							selected &&
-							clearProfileCredentials(selected.id).then(() =>
-								showToast('success', m.credentials_cleared())
-							)}
-					>
-						{m.clear_credentials()}
-					</button>
-				</div>
-			{/if}
+					{#if selected}
+						<div class="grid shrink-0 grid-cols-2 gap-2 p-3 text-sm sm:grid-cols-4">
+							<div class="bg-base-200/40 rounded-box p-2">
+								<p class="text-base-content/50 text-xs">{m.status_label()}</p>
+								<p class={profileStatusClass}>{profileStatusLabel}</p>
+							</div>
+							<div class="bg-base-200/40 rounded-box p-2">
+								<p class="text-base-content/50 text-xs">{m.duration_label()}</p>
+								<p class="font-mono">{profileDurationText}</p>
+							</div>
+							<div class="bg-base-200/40 rounded-box p-2">
+								<p class="text-base-content/50 text-xs">{m.vpn_ip_label()}</p>
+								<p class="font-mono">{profileVpnIpText}</p>
+							</div>
+							<div class="bg-base-200/40 rounded-box p-2">
+								<p class="text-base-content/50 text-xs">{m.auth_label()}</p>
+								<p>
+									{selected.needsUserPass ? m.auth_user_pass() : m.auth_cert()}
+								</p>
+							</div>
+						</div>
 
-			<div class="border-ink-border/15 flex min-h-0 flex-1 flex-col border-t">
-				<div class="tabs tabs-box tabs-sm mx-3 mt-2 shrink-0">
-					<label class="tab cursor-pointer gap-1">
-						<input
-							type="radio"
-							name="portal_detail_tabs"
-							class="hidden"
-							checked={detailTab === 'performance'}
-							onchange={() => (detailTab = 'performance')}
-						/>
-						<WashIcon icon={washIcons.gauge} class="size-3.5" />
-						{m.tab_performance()}
-					</label>
-					<label class="tab cursor-pointer gap-1">
-						<input
-							type="radio"
-							name="portal_detail_tabs"
-							class="hidden"
-							checked={detailTab === 'log'}
-							onchange={() => void openLogTab()}
-						/>
-						<WashIcon icon={washIcons['scroll-text']} class="size-3.5" />
-						{m.tab_connection_log()}
-					</label>
-				</div>
+						<div class="flex shrink-0 flex-wrap items-end gap-2 px-3 pb-2">
+							<label class="form-control w-full max-w-xs">
+								<span class="label-text text-xs">{m.rename_profile()}</span>
+								<input class="input input-bordered input-sm cursor-text" bind:value={renameValue} />
+							</label>
+							<button
+								type="button"
+								class="btn btn-secondary btn-sm cursor-pointer"
+								disabled={busy}
+								onclick={onRename}>{m.rename()}</button
+							>
+							<button
+								type="button"
+								class="btn btn-ghost btn-sm btn-error cursor-pointer"
+								disabled={busy}
+								onclick={() => selected && onDelete(selected.id)}
+							>
+								<WashIcon icon={washIcons['trash-2']} class="size-4" />
+								{m.delete()}
+							</button>
+							<button
+								type="button"
+								class="btn btn-ghost btn-sm cursor-pointer"
+								onclick={() =>
+									selected &&
+									clearProfileCredentials(selected.id).then(() =>
+										showToast('success', m.credentials_cleared())
+									)}
+							>
+								{m.clear_credentials()}
+							</button>
+						</div>
+					{/if}
 
-				{#if detailTab === 'performance'}
-					<div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-3">
-						{#if selectedIsConnected}
-							<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-								<div class="bg-base-200/40 rounded-box flex items-center gap-3 p-4">
-									<WashIcon icon={washIcons['arrow-down']} class="text-success size-8" />
-									<div>
-										<p class="text-base-content/50 text-xs">{m.speed_down()}</p>
-										<p class="font-mono text-xl font-semibold">{formatRate(downBps)}</p>
-										<p class="text-base-content/50 font-mono text-xs">
-											{m.bytes_in()}: {formatBytes(bytesIn)}
-										</p>
+					<div class="border-ink-border/15 flex min-h-0 flex-1 flex-col border-t">
+						<div class="tabs tabs-box tabs-sm mx-3 mt-2 shrink-0">
+							<label class="tab cursor-pointer gap-1">
+								<input
+									type="radio"
+									name="portal_detail_tabs"
+									class="hidden"
+									checked={detailTab === 'performance'}
+									onchange={() => (detailTab = 'performance')}
+								/>
+								<WashIcon icon={washIcons.gauge} class="size-3.5" />
+								{m.tab_performance()}
+							</label>
+							<label class="tab cursor-pointer gap-1">
+								<input
+									type="radio"
+									name="portal_detail_tabs"
+									class="hidden"
+									checked={detailTab === 'log'}
+									onchange={() => void openLogTab()}
+								/>
+								<WashIcon icon={washIcons['scroll-text']} class="size-3.5" />
+								{m.tab_connection_log()}
+							</label>
+						</div>
+
+						{#if detailTab === 'performance'}
+							<div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-3">
+								{#if selectedIsConnected}
+									<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+										<div class="bg-base-200/40 rounded-box flex items-center gap-3 p-4">
+											<WashIcon icon={washIcons['arrow-down']} class="text-success size-8" />
+											<div>
+												<p class="text-base-content/50 text-xs">{m.speed_down()}</p>
+												<p class="font-mono text-xl font-semibold">{formatRate(downBps)}</p>
+												<p class="text-base-content/50 font-mono text-xs">
+													{m.bytes_in()}: {formatBytes(bytesIn)}
+												</p>
+											</div>
+										</div>
+										<div class="bg-base-200/40 rounded-box flex items-center gap-3 p-4">
+											<WashIcon icon={washIcons['arrow-up']} class="text-info size-8" />
+											<div>
+												<p class="text-base-content/50 text-xs">{m.speed_up()}</p>
+												<p class="font-mono text-xl font-semibold">{formatRate(upBps)}</p>
+												<p class="text-base-content/50 font-mono text-xs">
+													{m.bytes_out()}: {formatBytes(bytesOut)}
+												</p>
+											</div>
+										</div>
 									</div>
-								</div>
-								<div class="bg-base-200/40 rounded-box flex items-center gap-3 p-4">
-									<WashIcon icon={washIcons['arrow-up']} class="text-info size-8" />
-									<div>
-										<p class="text-base-content/50 text-xs">{m.speed_up()}</p>
-										<p class="font-mono text-xl font-semibold">{formatRate(upBps)}</p>
-										<p class="text-base-content/50 font-mono text-xs">
-											{m.bytes_out()}: {formatBytes(bytesOut)}
-										</p>
-									</div>
-								</div>
+								{:else}
+									<p class="text-base-content/60 p-4 text-sm">{m.perf_idle()}</p>
+								{/if}
 							</div>
 						{:else}
-							<p class="text-base-content/60 p-4 text-sm">{m.perf_idle()}</p>
+							<div class="relative flex min-h-0 flex-1 flex-col px-3 pt-1.5 pb-3">
+								<div class="absolute top-2 right-4 z-10">
+									<div
+										class={washRecipes.tooltipIcon('secondary', 'left')}
+										data-tip={m.copy_logs()}
+									>
+										<button
+											type="button"
+											class="{washRecipes.btnRipple} btn-ghost btn-square btn-secondary btn-xs cursor-pointer"
+											aria-label={m.copy_logs()}
+											onclick={() => void navigator.clipboard.writeText(logs.join('\n'))}
+										>
+											<WashIcon icon={washIcons.copy} class="size-3.5" />
+										</button>
+									</div>
+								</div>
+								<div
+									class="mockup-code min-h-0 flex-1 overflow-x-hidden overflow-y-auto font-mono text-xs leading-relaxed"
+									role="log"
+									aria-live="polite"
+									aria-relevant="additions"
+									aria-label={m.logs_title()}
+								>
+									{#if logs.length}
+										{#each logs as line, i (i)}
+											{@const parsed = parsePortalLogLine(line)}
+											<pre
+												data-prefix={parsed.prefix}
+												class="{parsed.prefixClass} !w-full max-w-full !min-w-0 break-all whitespace-pre-wrap"><code
+													class="break-all whitespace-pre-wrap"
+													>{#each parsed.segments as seg, si (`${i}-${si}`)}<span
+															class={seg.className}>{seg.text}</span
+														>{/each}</code
+												></pre>
+										{/each}
+									{:else}
+										<pre
+											data-prefix="~"
+											class="text-base-content/50 !w-full max-w-full !min-w-0 break-all whitespace-pre-wrap"><code
+												class="text-base-content/50 break-all whitespace-pre-wrap"
+												>{m.logs_empty()}</code
+											></pre>
+									{/if}
+								</div>
+							</div>
 						{/if}
 					</div>
-				{:else}
-					<div class="relative flex min-h-0 flex-1 flex-col px-3 pt-1.5 pb-3">
-						<div class="absolute top-2 right-4 z-10">
-							<div class={washRecipes.tooltipIcon('secondary', 'left')} data-tip={m.copy_logs()}>
-								<button
-									type="button"
-									class="{washRecipes.btnRipple} btn-ghost btn-square btn-secondary btn-xs cursor-pointer"
-									aria-label={m.copy_logs()}
-									onclick={() => void navigator.clipboard.writeText(logs.join('\n'))}
-								>
-									<WashIcon icon={washIcons.copy} class="size-3.5" />
-								</button>
-							</div>
-						</div>
-						<div
-							class="mockup-code min-h-0 flex-1 overflow-x-hidden overflow-y-auto font-mono text-xs leading-relaxed"
-							role="log"
-							aria-live="polite"
-							aria-relevant="additions"
-							aria-label={m.logs_title()}
-						>
-							{#if logs.length}
-								{#each logs as line, i (i)}
-									{@const parsed = parsePortalLogLine(line)}
-									<pre
-										data-prefix={parsed.prefix}
-										class="{parsed.prefixClass} !w-full max-w-full !min-w-0 break-all whitespace-pre-wrap"><code
-											class="break-all whitespace-pre-wrap"
-											>{#each parsed.segments as seg, si (`${i}-${si}`)}<span class={seg.className}
-													>{seg.text}</span
-												>{/each}</code
-										></pre>
-								{/each}
-							{:else}
-								<pre
-									data-prefix="~"
-									class="text-base-content/50 !w-full max-w-full !min-w-0 break-all whitespace-pre-wrap"><code
-										class="text-base-content/50 break-all whitespace-pre-wrap"
-										>{m.logs_empty()}</code
-									></pre>
-							{/if}
-						</div>
-					</div>
-				{/if}
+				</section>
 			</div>
-		</section>
+		{/if}
 	</div>
 {/if}
 
@@ -1005,18 +1126,39 @@
 	</dialog>
 {/if}
 
-{#if settingsOpen && settings}
+{#if settingsOpen && settings && protoSettings}
 	<dialog class="modal modal-open">
 		<div class="modal-box max-w-lg">
 			<h2 class="card-title text-secondary font-bold">{m.settings()}</h2>
+			<div class="form-control mt-3 w-full">
+				<span class="label-text mb-1">{m.setting_protocol()}</span>
+				<WashSelect
+					value={settingsProtocol}
+					options={[
+						{ value: 'openvpn', label: m.protocol_openvpn() },
+						{ value: 'globalprotect', label: m.protocol_globalprotect() }
+					]}
+					onchange={(v) => {
+						settingsProtocol = v as VpnProtocol;
+					}}
+				/>
+			</div>
 			<label class="mt-3 flex cursor-pointer items-center justify-between gap-2 text-sm">
 				<span>{m.setting_reconnect()}</span>
 				<input
 					type="checkbox"
 					class="toggle"
-					checked={settings.reconnectOnDrop}
-					onchange={(e) =>
-						settings && (settings.reconnectOnDrop = (e.currentTarget as HTMLInputElement).checked)}
+					checked={protoSettings.reconnectOnDrop}
+					onchange={(e) => {
+						if (!settings) return;
+						const checked = (e.currentTarget as HTMLInputElement).checked;
+						if (settingsProtocol === 'globalprotect') {
+							settings.globalprotect.reconnectOnDrop = checked;
+						} else {
+							settings.openvpn.reconnectOnDrop = checked;
+						}
+						settings = { ...settings };
+					}}
 				/>
 			</label>
 			<label class="mt-2 flex cursor-pointer items-center justify-between gap-2 text-sm">
@@ -1024,9 +1166,17 @@
 				<input
 					type="checkbox"
 					class="toggle"
-					checked={settings.killSwitch}
-					onchange={(e) =>
-						settings && (settings.killSwitch = (e.currentTarget as HTMLInputElement).checked)}
+					checked={protoSettings.killSwitch}
+					onchange={(e) => {
+						if (!settings) return;
+						const checked = (e.currentTarget as HTMLInputElement).checked;
+						if (settingsProtocol === 'globalprotect') {
+							settings.globalprotect.killSwitch = checked;
+						} else {
+							settings.openvpn.killSwitch = checked;
+						}
+						settings = { ...settings };
+					}}
 				/>
 			</label>
 			<label class="mt-2 flex cursor-pointer items-center justify-between gap-2 text-sm">
@@ -1034,26 +1184,141 @@
 				<input
 					type="checkbox"
 					class="toggle"
-					checked={settings.elevateOnConnect}
-					onchange={(e) =>
-						settings && (settings.elevateOnConnect = (e.currentTarget as HTMLInputElement).checked)}
+					checked={protoSettings.elevateOnConnect}
+					onchange={(e) => {
+						if (!settings) return;
+						const checked = (e.currentTarget as HTMLInputElement).checked;
+						if (settingsProtocol === 'globalprotect') {
+							settings.globalprotect.elevateOnConnect = checked;
+						} else {
+							settings.openvpn.elevateOnConnect = checked;
+						}
+						settings = { ...settings };
+					}}
 				/>
 			</label>
+			<div class="form-control mt-3 w-full">
+				<span class="label-text mb-1">{m.setting_credential_store()}</span>
+				<p class="text-base-content/60 mb-1 text-xs">{m.setting_credential_store_hint()}</p>
+				<WashSelect
+					value={protoSettings.credentialStore}
+					options={[
+						{ value: 'session', label: m.store_session() },
+						{ value: 'keyring', label: m.store_keyring() }
+					]}
+					onchange={(v) => {
+						if (!settings) return;
+						const store = (v === 'keyring' ? 'keyring' : 'session') as 'keyring' | 'session';
+						if (settingsProtocol === 'globalprotect') {
+							settings.globalprotect.credentialStore = store;
+						} else {
+							settings.openvpn.credentialStore = store;
+						}
+						settings = { ...settings };
+					}}
+				/>
+			</div>
 			<div class="form-control mt-3 w-full">
 				<span class="label-text mb-1">{m.setting_auto_connect()}</span>
 				<WashSelect
 					placeholder={m.auto_connect_off()}
-					value={settings.autoConnectProfileId ?? ''}
+					value={protoSettings.autoConnectProfileId ?? ''}
 					options={[
 						{ value: '', label: m.auto_connect_off() },
-						...profiles.map((p) => ({ value: p.id, label: p.name }))
+						...(settingsProtocol === 'openvpn'
+							? profiles.map((p) => ({ value: p.id, label: p.name }))
+							: [])
 					]}
 					onchange={(v) => {
 						if (!settings) return;
-						settings.autoConnectProfileId = v ? v : null;
+						const id = v ? v : null;
+						if (settingsProtocol === 'globalprotect') {
+							settings.globalprotect.autoConnectProfileId = id;
+						} else {
+							settings.openvpn.autoConnectProfileId = id;
+						}
+						settings = { ...settings };
 					}}
 				/>
 			</div>
+			{#if settingsProtocol === 'globalprotect'}
+				<label class="mt-2 flex cursor-pointer items-center justify-between gap-2 text-sm">
+					<span>{m.setting_cookie_cache()}</span>
+					<input
+						type="checkbox"
+						class="toggle"
+						checked={settings.globalprotect.cookieCacheEnabled}
+						onchange={(e) => {
+							if (!settings) return;
+							settings.globalprotect.cookieCacheEnabled = (
+								e.currentTarget as HTMLInputElement
+							).checked;
+							settings = { ...settings };
+						}}
+					/>
+				</label>
+				<label class="mt-2 flex cursor-pointer items-center justify-between gap-2 text-sm">
+					<span>{m.setting_ignore_tls()}</span>
+					<input
+						type="checkbox"
+						class="toggle"
+						checked={settings.globalprotect.ignoreTlsErrors}
+						onchange={(e) => {
+							if (!settings) return;
+							settings.globalprotect.ignoreTlsErrors = (
+								e.currentTarget as HTMLInputElement
+							).checked;
+							settings = { ...settings };
+						}}
+					/>
+				</label>
+				<label class="mt-2 flex cursor-pointer items-center justify-between gap-2 text-sm">
+					<span>{m.setting_fix_openssl()}</span>
+					<input
+						type="checkbox"
+						class="toggle"
+						checked={settings.globalprotect.fixOpenssl}
+						onchange={(e) => {
+							if (!settings) return;
+							settings.globalprotect.fixOpenssl = (e.currentTarget as HTMLInputElement).checked;
+							settings = { ...settings };
+						}}
+					/>
+				</label>
+				<div class="form-control mt-2 w-full">
+					<span class="label-text mb-1">{m.setting_browser_mode()}</span>
+					<WashSelect
+						value={settings.globalprotect.defaultBrowserMode}
+						options={[
+							{ value: 'auto', label: m.browser_auto() },
+							{ value: 'default', label: m.browser_default() },
+							{ value: 'remote', label: m.browser_remote() },
+							{ value: 'embedded', label: m.browser_embedded() }
+						]}
+						onchange={(v) => {
+							if (!settings) return;
+							settings.globalprotect.defaultBrowserMode = v as
+								'auto' | 'default' | 'remote' | 'embedded';
+							settings = { ...settings };
+						}}
+					/>
+				</div>
+				<div class="form-control mt-2 w-full">
+					<label class="label" for="gp-default-os"
+						><span class="label-text">{m.setting_default_os()}</span></label
+					>
+					<input
+						id="gp-default-os"
+						class="input input-bordered input-sm cursor-text"
+						value={settings.globalprotect.defaultOs}
+						oninput={(e) => {
+							if (!settings) return;
+							settings.globalprotect.defaultOs = (e.currentTarget as HTMLInputElement).value;
+							settings = { ...settings };
+						}}
+					/>
+				</div>
+			{/if}
 			<p class="text-base-content/70 mt-3 text-sm">{m.setting_tray()}</p>
 			<p class="text-base-content/50 mt-2 text-xs">{m.setting_kill_switch_hint()}</p>
 			<div class="modal-action">

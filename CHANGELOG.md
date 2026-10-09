@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+## 0.3.0
+
+- Dual-mode OpenVPN and GlobalProtect (bundled gpclient/gpauth)
+- Independent tunnels with serial connect queue and shared Linux kill switch
+- GlobalProtect profiles: auth modes, certs, HIP, gateways, advanced flags, cookie cache
+- Protocol-scoped settings and dual titlebar status icons
+- Tray Connect submenu lists both protocol recent profiles
+- Fix GlobalProtect reconnect after disconnect (elevated tunnel teardown, fresh password auth)
+- Keep Disconnect responsive (no hang on pkexec cleanup)
+- Clearer GlobalProtect auth errors for non-SAML portals and TLS settings
+
 ## 0.2.0
 
 - Close to tray while Quit disconnects the tunnel and exits

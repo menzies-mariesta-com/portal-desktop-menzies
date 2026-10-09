@@ -1,6 +1,6 @@
 [package]
 name = "portal-desktop-menzies"
-version = "0.2.0"
+version = "0.3.0"
 description = "Menzies OS portal desktop app"
 authors = ["Mariesta"]
 license = "GPL-3.0-or-later"
@@ -22,7 +22,7 @@ dirs = "6"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
-tauri = { version = "2.11.3", features = ["tray-icon", "image-png"] }
+tauri = { version = "2.11.3", features = ["protocol-asset", "tray-icon", "image-png"] }
 tauri-plugin-log = "2"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-dialog = "2"

@@ -1,5 +1,6 @@
-//! Bundled OpenVPN process management (one tunnel).
+//! Bundled OpenVPN process management (one OpenVPN tunnel slot).
 
+use crate::kill_switch;
 use crate::paths::{self, PathError};
 use serde::Serialize;
 use std::fs;
@@ -36,6 +37,14 @@ pub struct ConnStatus {
     pub vpn_ip: Option<String>,
     pub started_at_ms: Option<u64>,
     pub management_port: Option<u16>,
+    #[serde(default = "default_protocol_openvpn")]
+    pub protocol: String,
+    pub interface_name: Option<String>,
+}
+
+#[allow(dead_code)]
+fn default_protocol_openvpn() -> String {
+    "openvpn".into()
 }
 
 impl Default for ConnStatus {
@@ -47,6 +56,8 @@ impl Default for ConnStatus {
             vpn_ip: None,
             started_at_ms: None,
             management_port: None,
+            protocol: "openvpn".into(),
+            interface_name: None,
         }
     }
 }
@@ -261,10 +272,9 @@ pub fn disconnect_tunnel(state: &SharedTunnel, app: &AppHandle) -> Result<(), St
         });
     }
 
-    #[cfg(target_os = "linux")]
     if kill_switch {
         thread::spawn(|| {
-            let _ = clear_kill_switch();
+            let _ = kill_switch::unregister_interface("openvpn");
         });
     }
 
@@ -278,6 +288,8 @@ pub fn disconnect_tunnel(state: &SharedTunnel, app: &AppHandle) -> Result<(), St
             vpn_ip: None,
             started_at_ms: None,
             management_port: None,
+            protocol: "openvpn".into(),
+            interface_name: None,
         },
     );
     Ok(())
@@ -302,53 +314,8 @@ pub fn send_management_auth(port: u16, password_type: &str, password: &str) -> R
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn apply_kill_switch() -> Result<(), String> {
-    // Minimal outbound block except loopback and established. Requires root via pkexec.
-    let script = r#"
-nft delete table inet portal_ks 2>/dev/null || true
-nft add table inet portal_ks
-nft add chain inet portal_ks output '{ type filter hook output priority 0; policy drop; }'
-nft add rule inet portal_ks output oiflo "lo" accept
-nft add rule inet portal_ks output ct state established,related accept
-nft add rule inet portal_ks output meta l4proto icmp accept
-"#;
-    let status = Command::new("pkexec")
-        .args(["sh", "-c", script])
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err(
-            "Kill switch could not be applied. Polkit authentication may have failed.".into(),
-        );
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn clear_kill_switch() -> Result<(), String> {
-    let status = Command::new("pkexec")
-        .args([
-            "sh",
-            "-c",
-            "nft delete table inet portal_ks 2>/dev/null || true",
-        ])
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("Kill switch could not be cleared.".into());
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn apply_kill_switch() -> Result<(), String> {
-    Err("Kill switch is only available on Linux in this version.".into())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn clear_kill_switch() -> Result<(), String> {
-    Ok(())
+    kill_switch::register_interface("openvpn")
 }
 
 pub struct ConnectArgs {
@@ -401,6 +368,8 @@ pub fn connect_tunnel(
                     .unwrap_or(0),
             ),
             management_port: Some(mgmt_port),
+            protocol: "openvpn".into(),
+            interface_name: Some("tun0".into()),
         };
     }
     set_status(&state, &app, current_status(&state));
